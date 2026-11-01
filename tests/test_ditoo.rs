@@ -58,11 +58,26 @@ fn test_priority_queue_ordering() {
     let mut queue = VecDeque::new();
 
     let items = vec![
-        TestItem { name: "normal1", priority: Priority::Normal },
-        TestItem { name: "low1", priority: Priority::Low },
-        TestItem { name: "urgent1", priority: Priority::Urgent },
-        TestItem { name: "high1", priority: Priority::High },
-        TestItem { name: "normal2", priority: Priority::Normal },
+        TestItem {
+            name: "normal1",
+            priority: Priority::Normal,
+        },
+        TestItem {
+            name: "low1",
+            priority: Priority::Low,
+        },
+        TestItem {
+            name: "urgent1",
+            priority: Priority::Urgent,
+        },
+        TestItem {
+            name: "high1",
+            priority: Priority::High,
+        },
+        TestItem {
+            name: "normal2",
+            priority: Priority::Normal,
+        },
     ];
 
     for item in items {
@@ -86,11 +101,11 @@ fn test_priority_queue_ordering() {
 
 #[test]
 fn test_daemon_state_enqueue_capacity_and_eviction() {
-    use divoom_ditoo_controller::daemon::{DaemonState, NotificationItem, Priority, MAX_QUEUE_SIZE};
     use divoom_ditoo_controller::config::Config;
-    use divoom_ditoo_controller::battery::DeviceBatteryState;
+    use divoom_ditoo_controller::daemon::{
+        DaemonState, MAX_QUEUE_SIZE, NotificationItem, Priority,
+    };
     use std::time::Instant;
-
     let mut state = DaemonState {
         config: Config::default(),
         device: None,
@@ -98,7 +113,7 @@ fn test_daemon_state_enqueue_capacity_and_eviction() {
         queue: VecDeque::new(),
         last_notification: None,
         is_displaying: false,
-        device_battery: DeviceBatteryState::default(),
+        laptop_battery: None,
         is_battery_override: false,
     };
 

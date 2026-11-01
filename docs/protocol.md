@@ -100,13 +100,11 @@ Transfers 16×16 pixel art or multi-frame GIF animations:
 - **GetVolume**: `0x09` with empty payload; returns current volume level (`0..16`).
 - **SetVolume**: `0x08` with payload `[volume_level]`.
 
-### 3.7 Device Battery Query (`0x5f`)
-Queries current battery percentage and charging state directly from the device:
+### 3.7 Device Battery Query (`0x5f`) [Unsupported by Ditoo Pro Firmware]
+In older Divoom devices, opcode `0x5f` queried internal battery level:
 - **Command**: `0x5f`
 - **Payload**: None (empty)
-- **Response Format**:
-  - `payload[0]`: Battery percentage (`0..=100`)
-  - `payload[1]`: Charging flag (`0x01` = charging, `0x00` = discharging)
+- **Note**: Stock Ditoo Pro firmware (`306007`) does not respond to `0x5f` and does not expose `org.bluez.Battery1`. Rather than simulating a device battery, the controller monitors the Linux host laptop's battery instead.
 
 ### 3.8 Clock Face ID (`0xbd`)
 Extended command selector:

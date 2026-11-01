@@ -51,4 +51,4 @@ A critical finding of Phase 1 research:
 
 - **Root Access**: **NOT required**. BlueZ provides user-level D-Bus APIs and user-accessible RFCOMM sockets for paired devices.
 - **BlueZ Profile Registration**: The `bluer` crate registers a user-session client profile with UUID `00001101-0000-1000-8000-00805f9b34fb`. BlueZ completes SDP resolution and passes the active stream file descriptor directly to the application without elevated privileges.
-- **Device Battery Interface**: Modern BlueZ automatically exposes `org.bluez.Battery1` on the device D-Bus object path when connected, allowing unprivileged percentage queries without active RFCOMM polling.
+- **Host Battery Interface**: The Ditoo Pro stock firmware (v306007) does not expose `org.bluez.Battery1` or report internal battery over RFCOMM. The controller monitors the Linux host laptop's battery instead via `/sys/class/power_supply/BAT*`.

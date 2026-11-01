@@ -1,153 +1,95 @@
-use std::fs;
-use std::path::PathBuf;
-use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
 
-/// State of the Divoom Ditoo Pro device battery
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceBatteryState {
+/// Host laptop battery information read from Linux sysfs (/sys/class/power_supply)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostBattery {
     /// Battery level in percent (0..=100)
     pub percent: u8,
-    /// Whether the Ditoo Pro is actively plugged into USB / charging
+    /// Whether the laptop is actively charging or connected to AC power
     pub is_charging: bool,
-    /// Timestamp when this state was last recorded or updated
-    pub updated_at: DateTime<Local>,
+    /// Whether external AC power adapter is connected
+    pub ac_online: bool,
+    /// Raw sysfs status string ("Charging", "Discharging", "Full", "Not charging", etc.)
+    pub status: String,
 }
 
-impl Default for DeviceBatteryState {
-    fn default() -> Self {
-        Self {
-            percent: 85,
-            is_charging: false,
-            updated_at: Local::now(),
-        }
-    }
-}
+pub type HostBatteryInfo = HostBattery;
 
-impl DeviceBatteryState {
-    #[allow(dead_code)]
-    pub fn new(percent: u8, is_charging: bool) -> Self {
+impl HostBattery {
+    pub fn new(percent: u8, is_charging: bool, ac_online: bool, status: &str) -> Self {
         Self {
             percent: percent.min(100),
             is_charging,
-            updated_at: Local::now(),
+            ac_online,
+            status: status.to_string(),
         }
     }
 
     /// Low battery warning threshold: <= 20% and not charging
     pub fn is_low(&self) -> bool {
-        self.percent <= 20 && !self.is_charging
+        self.is_low_with_threshold(20)
+    }
+
+    pub fn is_low_with_threshold(&self, threshold: u8) -> bool {
+        self.percent <= threshold && !self.is_charging
     }
 
     /// Critical battery threshold: < 10% and not charging
     pub fn is_critical(&self) -> bool {
-        self.percent < 10 && !self.is_charging
+        self.is_critical_with_threshold(10)
     }
 
-    /// Whether the device battery state requires overriding the clock with the battery icon
+    pub fn is_critical_with_threshold(&self, threshold: u8) -> bool {
+        self.percent < threshold && !self.is_charging
+    }
+
+    /// Whether the battery state requires overriding the clock with the battery icon
     /// Rules:
-    /// - If device is charging: NEVER override clock (even if < 10%)
-    /// - If device is NOT charging and < 10%: MUST override clock with battery icon so user is prompted to charge
+    /// - If charging / AC plugged in: NEVER override clock (even if < 10%)
+    /// - If NOT charging and < 10%: MUST override clock with battery icon so user is prompted to plug in
     pub fn should_override_clock(&self) -> bool {
         self.is_critical()
     }
 
+    pub fn should_override_clock_with_threshold(&self, threshold: u8) -> bool {
+        self.is_critical_with_threshold(threshold)
+    }
+
     pub fn description(&self) -> String {
-        let state_str = if self.is_charging {
-            "Charging (⚡)"
+        let chg_str = if self.is_charging {
+            " [Charging ⚡]"
+        } else if self.ac_online {
+            " [AC Connected 🔌]"
         } else if self.is_critical() {
-            "CRITICAL (<10% - Battery icon replaces clock)"
+            " [CRITICAL <10% - Battery alert active]"
         } else if self.is_low() {
-            "Low warning (<=20%)"
+            " [Low warning <=20%]"
         } else {
-            "Normal"
+            " [Discharging]"
         };
-        format!("Ditoo Pro Battery: {}% [{}]", self.percent, state_str)
-    }
-
-    pub fn file_path() -> PathBuf {
-        crate::config::resolve_config_dir().join("ditoo").join("device_battery.json")
-    }
-
-    pub fn load() -> Self {
-        let path = Self::file_path();
-        if path.exists()
-            && let Ok(content) = fs::read_to_string(&path)
-                && let Ok(mut state) = serde_json::from_str::<DeviceBatteryState>(&content) {
-                    state.percent = state.percent.min(100);
-                    return state;
-                }
-        Self::default()
-    }
-
-    pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::file_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)
-    }
-
-    /// Advance battery state over elapsed time:
-    /// - If charging: charges at ~20% per hour (up to 100%)
-    /// - If discharging: discharges at ~10% per hour at standard brightness (down to 0%)
-    pub fn advance_time(&mut self, now: DateTime<Local>) {
-        let elapsed_secs = (now - self.updated_at).num_seconds();
-        if elapsed_secs < 30 {
-            return;
-        }
-
-        let hours = elapsed_secs as f64 / 3600.0;
-        if self.is_charging {
-            let gained = (hours * 20.0).round() as u8;
-            self.percent = (self.percent + gained).min(100);
-        } else {
-            let lost = (hours * 10.0).round() as u8;
-            self.percent = self.percent.saturating_sub(lost);
-        }
-        self.updated_at = now;
-        let _ = self.save();
+        format!("Laptop Battery: {}%{}", self.percent, chg_str)
     }
 }
 
-/// Query BlueZ D-Bus interface (org.bluez.Battery1) if exposed by Bluetooth stack
-pub fn query_bluez_battery(mac: &str) -> Option<u8> {
-    let dev_id = mac.replace(':', "_");
-    let path = format!("/org/bluez/hci0/dev_{dev_id}");
-
-    let output = std::process::Command::new("busctl")
-        .args(["get-property", "org.bluez", &path, "org.bluez.Battery1", "Percentage"])
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parts: Vec<&str> = stdout.split_whitespace().collect();
-        if parts.len() >= 2
-            && let Ok(pct) = parts[1].parse::<u8>() {
-                return Some(pct.min(100));
-            }
-    }
-    None
+/// Detect and read host laptop battery from Linux sysfs (/sys/class/power_supply).
+/// Returns `None` if running on a desktop PC or system without a battery.
+pub fn get_host_battery() -> Option<HostBattery> {
+    read_battery_from_sysfs(Path::new("/sys/class/power_supply"))
 }
 
-/// Optional helper for Linux host laptop battery (/sys/class/power_supply)
-/// Explicitly distinct from Ditoo Pro device battery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct HostBatteryInfo {
-    pub capacity: u8,
-    pub status: String,
-    pub is_charging: bool,
+pub fn get_host_laptop_battery() -> Option<HostBattery> {
+    get_host_battery()
 }
 
-#[allow(dead_code)]
-pub fn get_host_laptop_battery() -> Option<HostBatteryInfo> {
-    let base = PathBuf::from("/sys/class/power_supply");
+/// Testable sysfs battery reader
+pub fn read_battery_from_sysfs(base: &Path) -> Option<HostBattery> {
     if !base.exists() {
         return None;
     }
+
+    let ac_online = check_ac_online(base);
 
     let entries = fs::read_dir(base).ok()?;
     for entry in entries.flatten() {
@@ -157,20 +99,42 @@ pub fn get_host_laptop_battery() -> Option<HostBatteryInfo> {
             let stat_path = entry.path().join("status");
 
             if let Ok(cap_str) = fs::read_to_string(&cap_path)
-                && let Ok(capacity) = cap_str.trim().parse::<u8>() {
-                    let status = fs::read_to_string(&stat_path)
-                        .unwrap_or_else(|_| "Unknown".into())
-                        .trim()
-                        .to_string();
-                    let is_charging = status.eq_ignore_ascii_case("charging");
-                    return Some(HostBatteryInfo {
-                        capacity,
-                        status,
-                        is_charging,
-                    });
-                }
+                && let Ok(capacity) = cap_str.trim().parse::<u8>()
+            {
+                let status = fs::read_to_string(&stat_path)
+                    .unwrap_or_else(|_| "Unknown".into())
+                    .trim()
+                    .to_string();
+                let is_charging = status.eq_ignore_ascii_case("charging")
+                    || (ac_online && !status.eq_ignore_ascii_case("discharging"));
+
+                return Some(HostBattery {
+                    percent: capacity.min(100),
+                    is_charging,
+                    ac_online,
+                    status,
+                });
+            }
         }
     }
 
     None
+}
+
+/// Helper to check if any AC power adapter is online
+fn check_ac_online(base: &Path) -> bool {
+    if let Ok(entries) = fs::read_dir(base) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with("AC") || file_name.starts_with("ADP") {
+                let online_path = entry.path().join("online");
+                if let Ok(online_str) = fs::read_to_string(&online_path)
+                    && online_str.trim() == "1"
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }

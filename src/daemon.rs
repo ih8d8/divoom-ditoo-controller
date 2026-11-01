@@ -10,16 +10,28 @@ use bluer::Address;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
-use crate::battery::{self, DeviceBatteryState};
-use crate::config::Config;
+use crate::battery::{self, HostBattery};
 use crate::canvas::{Canvas, CanvasType};
+use crate::config::Config;
 use crate::device::{self, DeviceHandle};
 use crate::icons;
 use crate::sysmon::{self, CpuSample, MemInfo};
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Priority {
     Low = 0,
@@ -103,7 +115,7 @@ pub struct DaemonState {
     pub queue: VecDeque<NotificationItem>,
     pub last_notification: Option<(String, Instant)>,
     pub is_displaying: bool,
-    pub device_battery: DeviceBatteryState,
+    pub laptop_battery: Option<HostBattery>,
     pub is_battery_override: bool,
 }
 
@@ -159,29 +171,29 @@ pub async fn run_daemon() -> Result<(), Box<dyn Error>> {
     }
 
     // Spawn Bluetooth device worker
-    let (device_handle, device_addr) = match device::spawn_device_worker(config.device_mac.clone()).await {
-        Ok((handle, addr)) => {
-            log::info!("Target Ditoo Pro device: {}", addr);
-            if config.device_mac.is_none() {
-                config.device_mac = Some(addr.to_string());
-                let _ = config.save();
+    let (device_handle, device_addr) =
+        match device::spawn_device_worker(config.device_mac.clone()).await {
+            Ok((handle, addr)) => {
+                log::info!("Target Ditoo Pro device: {}", addr);
+                if config.device_mac.is_none() {
+                    config.device_mac = Some(addr.to_string());
+                    let _ = config.save();
+                }
+                (Some(handle), Some(addr))
             }
-            (Some(handle), Some(addr))
-        }
-        Err(e) => {
-            log::warn!("Could not immediately connect to Ditoo Pro: {}. Will retry on demand.", e);
-            (None, None)
-        }
-    };
+            Err(e) => {
+                log::warn!(
+                    "Could not immediately connect to Ditoo Pro: {}. Will retry on demand.",
+                    e
+                );
+                (None, None)
+            }
+        };
 
-    let mut device_battery = DeviceBatteryState::load();
-    if let Some(ref addr) = device_addr
-        && let Some(bz_pct) = battery::query_bluez_battery(&addr.to_string()) {
-            device_battery.percent = bz_pct;
-            let _ = device_battery.save();
-        }
-
-    let initial_battery_override = device_battery.should_override_clock();
+    let initial_battery = battery::get_host_battery();
+    let initial_battery_override = initial_battery.as_ref().is_some_and(|b| {
+        b.should_override_clock_with_threshold(config.laptop_battery.critical_threshold)
+    });
 
     let state = Arc::new(Mutex::new(DaemonState {
         config: config.clone(),
@@ -190,7 +202,7 @@ pub async fn run_daemon() -> Result<(), Box<dyn Error>> {
         queue: VecDeque::new(),
         last_notification: None,
         is_displaying: false,
-        device_battery: device_battery.clone(),
+        laptop_battery: initial_battery.clone(),
         is_battery_override: initial_battery_override,
     }));
 
@@ -201,9 +213,11 @@ pub async fn run_daemon() -> Result<(), Box<dyn Error>> {
         log::info!("Initial RTC clock synchronization...");
         let _ = dev.sync_time().await;
 
-        if initial_battery_override {
-            log::warn!("Device battery is critical (<10% and not charging). Displaying battery icon instead of clock.");
-            let canvas = Canvas::render_battery(device_battery.percent, false, true);
+        if initial_battery_override && let Some(ref bat) = initial_battery {
+            log::warn!(
+                "Laptop battery is critical (<10% and not charging). Displaying battery icon instead of clock."
+            );
+            let canvas = Canvas::render_battery(bat.percent, bat.is_charging, true);
             if let Ok(temp_path) = canvas.to_temp_png() {
                 let _ = dev.show_image(temp_path.clone()).await;
                 let _ = fs::remove_file(temp_path);
@@ -247,72 +261,88 @@ pub async fn run_daemon() -> Result<(), Box<dyn Error>> {
         interval.tick().await; // skip immediate first tick
         loop {
             interval.tick().await;
-            let now_local = chrono::Local::now();
             let now_instant = Instant::now();
 
-            // 1. Device Battery Monitoring & State Transition
-            let (dev_opt, should_restore_clock, should_override_battery, bat_pct, low_warn_canvas) = {
+            // 1. Host Laptop Battery Monitoring & State Transition
+            let (dev_opt, should_restore_clock, should_override_battery, bat_info, low_warn_canvas) = {
                 let mut st = state_monitor.lock().await;
+                let current_battery = battery::get_host_battery();
+                st.laptop_battery = current_battery.clone();
 
-                // Check BlueZ D-Bus battery if device address is known
-                if let Some(addr) = st.device_addr
-                    && let Some(bz_pct) = battery::query_bluez_battery(&addr.to_string()) {
-                        st.device_battery.percent = bz_pct;
-                    }
-
-                // Advance battery discharge or charge
-                st.device_battery.advance_time(now_local);
+                let critical_threshold = st.config.laptop_battery.critical_threshold;
+                let low_threshold = st.config.laptop_battery.low_threshold;
+                let needs_override = current_battery
+                    .as_ref()
+                    .is_some_and(|b| b.should_override_clock_with_threshold(critical_threshold));
 
                 let currently_overriding = st.is_battery_override;
-                let needs_override = st.device_battery.should_override_clock();
-
                 let mut restore_clk = false;
                 let mut trigger_override = false;
                 let mut low_canvas = None;
 
-                if needs_override && !currently_overriding && !st.is_displaying && st.queue.is_empty() {
-                    // Transition: dropped below 10% and not charging -> show battery icon
+                if needs_override
+                    && !currently_overriding
+                    && !st.is_displaying
+                    && st.queue.is_empty()
+                {
+                    // Transition: laptop battery dropped below critical threshold and not charging -> show battery icon
                     st.is_battery_override = true;
                     trigger_override = true;
                 } else if !needs_override && currently_overriding {
-                    // Transition: plugged in or battery rose -> restore clock!
+                    // Transition: plugged into AC power or battery rose -> restore clock!
                     st.is_battery_override = false;
                     restore_clk = true;
-                } else if st.device_battery.is_low() && !needs_override {
-                    // Low warning (10..=20% and not charging)
-                    let cooldown_secs = st.config.device_battery.warn_cooldown_mins * 60;
-                    if now_instant.duration_since(last_low_battery_alert) >= Duration::from_secs(cooldown_secs) {
+                } else if let Some(ref bat) = current_battery
+                    && bat.is_low_with_threshold(low_threshold)
+                    && !needs_override
+                {
+                    // Low warning (10..=20% and discharging)
+                    let cooldown_secs = st.config.laptop_battery.warn_cooldown_mins * 60;
+                    if now_instant.duration_since(last_low_battery_alert)
+                        >= Duration::from_secs(cooldown_secs)
+                    {
                         last_low_battery_alert = now_instant;
                         low_canvas = Some(CanvasType::Battery {
-                            percent: st.device_battery.percent,
-                            charging: false,
+                            percent: bat.percent,
+                            charging: bat.is_charging,
                             is_low: true,
                         });
                     }
                 }
 
-                (st.device.clone(), restore_clk, trigger_override, st.device_battery.percent, low_canvas)
+                (
+                    st.device.clone(),
+                    restore_clk,
+                    trigger_override,
+                    current_battery,
+                    low_canvas,
+                )
             };
 
             if let Some(ref dev) = dev_opt {
-                if should_override_battery {
-                    log::warn!("Background monitor: device battery critical (<10%). Displaying battery icon instead of clock.");
-                    let canvas = Canvas::render_battery(bat_pct, false, true);
+                if should_override_battery && let Some(ref bat) = bat_info {
+                    log::warn!(
+                        "Background monitor: laptop battery critical (<10%). Displaying battery icon instead of clock."
+                    );
+                    let canvas = Canvas::render_battery(bat.percent, bat.is_charging, true);
                     if let Ok(temp_path) = canvas.to_temp_png() {
                         let _ = dev.show_image(temp_path.clone()).await;
                         let _ = fs::remove_file(temp_path);
                     }
                 } else if should_restore_clock {
-                    log::info!("Background monitor: device charging or recovered. Restoring clock.");
+                    log::info!(
+                        "Background monitor: laptop plugged in or recovered. Restoring clock."
+                    );
                     let _ = dev.show_clock().await;
                 }
             }
 
             if let Some(canvas) = low_warn_canvas {
+                let pct = bat_info.as_ref().map_or(0, |b| b.percent);
                 let mut st = state_monitor.lock().await;
                 st.enqueue(NotificationItem {
-                    message: format!("Battery low: {}%", bat_pct),
-                    title: Some("Low Battery".into()),
+                    message: format!("Laptop battery low: {}%", pct),
+                    title: Some("Low Laptop Battery".into()),
                     icon: None,
                     canvas: Some(canvas),
                     duration: 8.0,
@@ -325,7 +355,15 @@ pub async fn run_daemon() -> Result<(), Box<dyn Error>> {
             }
 
             // 2. Sysmon (CPU, RAM & Disk) Monitoring
-            let (sysmon_enabled, cpu_thresh, ram_thresh, disk_thresh, disk_mount, cooldown_dur, alert_dur) = {
+            let (
+                sysmon_enabled,
+                cpu_thresh,
+                ram_thresh,
+                disk_thresh,
+                disk_mount,
+                cooldown_dur,
+                alert_dur,
+            ) = {
                 let st = state_monitor.lock().await;
                 (
                     st.config.sysmon.enabled,
@@ -338,97 +376,109 @@ pub async fn run_daemon() -> Result<(), Box<dyn Error>> {
                 )
             };
 
-            if sysmon_enabled
-                && let Some(curr_sample) = CpuSample::read() {
-                    let cpu_pct = curr_sample.usage_since(&last_cpu_sample);
-                    last_cpu_sample = curr_sample;
+            if sysmon_enabled && let Some(curr_sample) = CpuSample::read() {
+                let cpu_pct = curr_sample.usage_since(&last_cpu_sample);
+                last_cpu_sample = curr_sample;
 
-                    let mem = MemInfo::read().unwrap_or_default();
-                    let ram_pct = mem.percent_used;
+                let mem = MemInfo::read().unwrap_or_default();
+                let ram_pct = mem.percent_used;
 
-                    let disk = sysmon::DiskInfo::read_mount(&disk_mount).unwrap_or_default();
-                    let disk_pct = disk.percent_used;
+                let disk = sysmon::DiskInfo::read_mount(&disk_mount).unwrap_or_default();
+                let disk_pct = disk.percent_used;
 
-                    let cpu_high = cpu_pct >= cpu_thresh;
-                    let ram_high = ram_pct >= ram_thresh;
-                    let disk_high = disk_pct >= disk_thresh;
+                let cpu_high = cpu_pct >= cpu_thresh;
+                let ram_high = ram_pct >= ram_thresh;
+                let disk_high = disk_pct >= disk_thresh;
 
-                    if cpu_high && now_instant.duration_since(last_cpu_alert) >= cooldown_dur {
-                        last_cpu_alert = now_instant;
-                        log::info!("Sysmon alert: High CPU usage ({:.1}% >= {:.1}%)", cpu_pct, cpu_thresh);
+                if cpu_high && now_instant.duration_since(last_cpu_alert) >= cooldown_dur {
+                    last_cpu_alert = now_instant;
+                    log::info!(
+                        "Sysmon alert: High CPU usage ({:.1}% >= {:.1}%)",
+                        cpu_pct,
+                        cpu_thresh
+                    );
 
-                        let gauge_color = if cpu_pct >= 90.0 { "red" } else { "amber" };
-                        let item = NotificationItem {
-                            message: format!("CPU: {:.0}%", cpu_pct),
-                            title: Some("High CPU".into()),
-                            icon: None,
-                            canvas: Some(CanvasType::Gauge {
-                                label: "CPU".into(),
-                                value: cpu_pct as u32,
-                                max: 100,
-                                color: gauge_color.into(),
-                            }),
-                            duration: alert_dur,
-                            priority: Priority::High,
-                            sound: false,
-                            created_at: now_instant,
-                        };
+                    let gauge_color = if cpu_pct >= 90.0 { "red" } else { "amber" };
+                    let item = NotificationItem {
+                        message: format!("CPU: {:.0}%", cpu_pct),
+                        title: Some("High CPU".into()),
+                        icon: None,
+                        canvas: Some(CanvasType::Gauge {
+                            label: "CPU".into(),
+                            value: cpu_pct as u32,
+                            max: 100,
+                            color: gauge_color.into(),
+                        }),
+                        duration: alert_dur,
+                        priority: Priority::High,
+                        sound: false,
+                        created_at: now_instant,
+                    };
 
-                        let mut st = state_monitor.lock().await;
-                        st.enqueue(item);
-                        drop(st);
-                        let _ = tx_monitor.send(()).await;
-                    } else if ram_high && now_instant.duration_since(last_ram_alert) >= cooldown_dur {
-                        last_ram_alert = now_instant;
-                        log::info!("Sysmon alert: High RAM usage ({:.1}% >= {:.1}%)", ram_pct, ram_thresh);
+                    let mut st = state_monitor.lock().await;
+                    st.enqueue(item);
+                    drop(st);
+                    let _ = tx_monitor.send(()).await;
+                } else if ram_high && now_instant.duration_since(last_ram_alert) >= cooldown_dur {
+                    last_ram_alert = now_instant;
+                    log::info!(
+                        "Sysmon alert: High RAM usage ({:.1}% >= {:.1}%)",
+                        ram_pct,
+                        ram_thresh
+                    );
 
-                        let item = NotificationItem {
-                            message: format!("RAM: {:.0}%", ram_pct),
-                            title: Some("High RAM".into()),
-                            icon: None,
-                            canvas: Some(CanvasType::Gauge {
-                                label: "RAM".into(),
-                                value: ram_pct as u32,
-                                max: 100,
-                                color: "magenta".into(),
-                            }),
-                            duration: alert_dur,
-                            priority: Priority::High,
-                            sound: false,
-                            created_at: now_instant,
-                        };
+                    let item = NotificationItem {
+                        message: format!("RAM: {:.0}%", ram_pct),
+                        title: Some("High RAM".into()),
+                        icon: None,
+                        canvas: Some(CanvasType::Gauge {
+                            label: "RAM".into(),
+                            value: ram_pct as u32,
+                            max: 100,
+                            color: "magenta".into(),
+                        }),
+                        duration: alert_dur,
+                        priority: Priority::High,
+                        sound: false,
+                        created_at: now_instant,
+                    };
 
-                        let mut st = state_monitor.lock().await;
-                        st.enqueue(item);
-                        drop(st);
-                        let _ = tx_monitor.send(()).await;
-                    } else if disk_high && now_instant.duration_since(last_disk_alert) >= cooldown_dur {
-                        last_disk_alert = now_instant;
-                        log::warn!("Sysmon alert: High Disk usage ({:.1}% >= {:.1}%) on '{}'", disk_pct, disk_thresh, disk_mount);
+                    let mut st = state_monitor.lock().await;
+                    st.enqueue(item);
+                    drop(st);
+                    let _ = tx_monitor.send(()).await;
+                } else if disk_high && now_instant.duration_since(last_disk_alert) >= cooldown_dur {
+                    last_disk_alert = now_instant;
+                    log::warn!(
+                        "Sysmon alert: High Disk usage ({:.1}% >= {:.1}%) on '{}'",
+                        disk_pct,
+                        disk_thresh,
+                        disk_mount
+                    );
 
-                        let gauge_color = if disk_pct >= 90.0 { "red" } else { "amber" };
-                        let item = NotificationItem {
-                            message: format!("DISK: {:.0}%", disk_pct),
-                            title: Some("High Disk".into()),
-                            icon: Some("disk".into()),
-                            canvas: Some(CanvasType::Gauge {
-                                label: "DISK".into(),
-                                value: disk_pct as u32,
-                                max: 100,
-                                color: gauge_color.into(),
-                            }),
-                            duration: alert_dur,
-                            priority: Priority::High,
-                            sound: false,
-                            created_at: now_instant,
-                        };
+                    let gauge_color = if disk_pct >= 90.0 { "red" } else { "amber" };
+                    let item = NotificationItem {
+                        message: format!("DISK: {:.0}%", disk_pct),
+                        title: Some("High Disk".into()),
+                        icon: Some("disk".into()),
+                        canvas: Some(CanvasType::Gauge {
+                            label: "DISK".into(),
+                            value: disk_pct as u32,
+                            max: 100,
+                            color: gauge_color.into(),
+                        }),
+                        duration: alert_dur,
+                        priority: Priority::High,
+                        sound: false,
+                        created_at: now_instant,
+                    };
 
-                        let mut st = state_monitor.lock().await;
-                        st.enqueue(item);
-                        drop(st);
-                        let _ = tx_monitor.send(()).await;
-                    }
+                    let mut st = state_monitor.lock().await;
+                    st.enqueue(item);
+                    drop(st);
+                    let _ = tx_monitor.send(()).await;
                 }
+            }
         }
     });
 
@@ -474,7 +524,8 @@ async fn handle_client(
         let cmd: Command = match serde_json::from_str(&line) {
             Ok(c) => c,
             Err(e) => {
-                let resp = serde_json::json!({"status": "error", "message": format!("Invalid JSON: {e}")});
+                let resp =
+                    serde_json::json!({"status": "error", "message": format!("Invalid JSON: {e}")});
                 writer.write_all(format!("{resp}\n").as_bytes()).await?;
                 continue;
             }
@@ -495,12 +546,14 @@ async fn handle_client(
                 // Check duplicate suppression within 3s
                 let now = Instant::now();
                 if let Some((ref last_msg, ref last_time)) = st.last_notification
-                    && last_msg == &message && now.duration_since(*last_time) < Duration::from_secs(3) {
-                        log::info!("Suppressed duplicate notification: {}", message);
-                        let resp = serde_json::json!({"status": "ok", "suppressed": true});
-                        writer.write_all(format!("{resp}\n").as_bytes()).await?;
-                        continue;
-                    }
+                    && last_msg == &message
+                    && now.duration_since(*last_time) < Duration::from_secs(3)
+                {
+                    log::info!("Suppressed duplicate notification: {}", message);
+                    let resp = serde_json::json!({"status": "ok", "suppressed": true});
+                    writer.write_all(format!("{resp}\n").as_bytes()).await?;
+                    continue;
+                }
                 st.last_notification = Some((message.clone(), now));
 
                 // Check quiet hours
@@ -559,25 +612,30 @@ async fn handle_client(
                 duration,
             } => {
                 let mut st = state.lock().await;
-                let mut changed = false;
+                let current_bat = battery::get_host_battery();
+                let bat_state = if let Some(p) = percent {
+                    let chg = charging.unwrap_or(false);
+                    Some(HostBattery::new(
+                        p,
+                        chg,
+                        chg,
+                        if chg { "Charging" } else { "Discharging" },
+                    ))
+                } else if let Some(mut b) = current_bat {
+                    if let Some(c) = charging {
+                        b.is_charging = c;
+                    }
+                    Some(b)
+                } else {
+                    None
+                };
 
-                if let Some(p) = percent {
-                    st.device_battery.percent = p.min(100);
-                    changed = true;
-                }
-                if let Some(c) = charging {
-                    st.device_battery.is_charging = c;
-                    changed = true;
-                }
-                if changed {
-                    st.device_battery.updated_at = chrono::Local::now();
-                    let _ = st.device_battery.save();
-                }
-
-                let bat_state = st.device_battery.clone();
                 let default_dur = st.config.default_duration;
-
-                let should_restore_clock = st.is_battery_override && !bat_state.should_override_clock();
+                let critical_threshold = st.config.laptop_battery.critical_threshold;
+                let should_restore_clock = st.is_battery_override
+                    && bat_state.as_ref().is_none_or(|b| {
+                        !b.should_override_clock_with_threshold(critical_threshold)
+                    });
                 if should_restore_clock {
                     st.is_battery_override = false;
                 }
@@ -588,15 +646,15 @@ async fn handle_client(
                     None
                 };
 
-                if display {
+                if display && let Some(ref b) = bat_state {
                     let item = NotificationItem {
-                        message: format!("Battery: {}%", bat_state.percent),
+                        message: format!("Battery: {}%", b.percent),
                         title: Some("Battery".into()),
                         icon: None,
                         canvas: Some(CanvasType::Battery {
-                            percent: bat_state.percent,
-                            charging: bat_state.is_charging,
-                            is_low: bat_state.is_low(),
+                            percent: b.percent,
+                            charging: b.is_charging,
+                            is_low: b.is_low(),
                         }),
                         duration: duration.unwrap_or(default_dur),
                         priority: Priority::Normal,
@@ -611,7 +669,7 @@ async fn handle_client(
                     let _ = dev.show_clock().await;
                 }
 
-                if display {
+                if display && bat_state.is_some() {
                     let _ = tx_notify.send(()).await;
                 }
 
@@ -621,17 +679,17 @@ async fn handle_client(
                 });
                 writer.write_all(format!("{resp}\n").as_bytes()).await?;
             }
-            Command::Sysmon {
-                display,
-                duration,
-            } => {
+            Command::Sysmon { display, duration } => {
                 let snapshot = sysmon::read_instant_snapshot();
                 let mut st = state.lock().await;
                 let default_dur = st.config.default_duration;
 
                 if display {
                     let item = NotificationItem {
-                        message: format!("CPU: {:.0}% RAM: {:.0}%", snapshot.cpu_pct, snapshot.ram_pct),
+                        message: format!(
+                            "CPU: {:.0}% RAM: {:.0}%",
+                            snapshot.cpu_pct, snapshot.ram_pct
+                        ),
                         title: Some("Sysmon".into()),
                         icon: None,
                         canvas: Some(CanvasType::Sysmon {
@@ -667,7 +725,8 @@ async fn handle_client(
                     };
                     writer.write_all(format!("{resp}\n").as_bytes()).await?;
                 } else {
-                    let resp = serde_json::json!({"status": "error", "message": "Device not connected"});
+                    let resp =
+                        serde_json::json!({"status": "error", "message": "Device not connected"});
                     writer.write_all(format!("{resp}\n").as_bytes()).await?;
                 }
             }
@@ -681,7 +740,8 @@ async fn handle_client(
                     };
                     writer.write_all(format!("{resp}\n").as_bytes()).await?;
                 } else {
-                    let resp = serde_json::json!({"status": "error", "message": "Device not connected"});
+                    let resp =
+                        serde_json::json!({"status": "error", "message": "Device not connected"});
                     writer.write_all(format!("{resp}\n").as_bytes()).await?;
                 }
             }
@@ -695,7 +755,8 @@ async fn handle_client(
                     };
                     writer.write_all(format!("{resp}\n").as_bytes()).await?;
                 } else {
-                    let resp = serde_json::json!({"status": "error", "message": "Device not connected"});
+                    let resp =
+                        serde_json::json!({"status": "error", "message": "Device not connected"});
                     writer.write_all(format!("{resp}\n").as_bytes()).await?;
                 }
             }
@@ -709,15 +770,17 @@ async fn handle_client(
                     };
                     writer.write_all(format!("{resp}\n").as_bytes()).await?;
                 } else {
-                    let resp = serde_json::json!({"status": "error", "message": "Device not connected"});
+                    let resp =
+                        serde_json::json!({"status": "error", "message": "Device not connected"});
                     writer.write_all(format!("{resp}\n").as_bytes()).await?;
                 }
             }
             Command::Status => {
                 let dev = ensure_device(&state).await;
                 let (battery_state, is_override) = {
-                    let st = state.lock().await;
-                    (st.device_battery.clone(), st.is_battery_override)
+                    let mut st = state.lock().await;
+                    st.laptop_battery = battery::get_host_battery();
+                    (st.laptop_battery.clone(), st.is_battery_override)
                 };
                 if let Some(dev) = dev {
                     let stat = dev.get_status().await.ok();
@@ -774,20 +837,31 @@ async fn worker_loop(state: Arc<Mutex<DaemonState>>, rx_notify: &mut mpsc::Recei
             process_notification(&item, &state).await;
         } else {
             // Restore clock OR battery critical alert when queue becomes empty
-            let (dev_opt, should_override, bat_percent) = {
+            let (dev_opt, should_override, bat_info) = {
                 let mut st = state.lock().await;
                 if st.is_displaying {
                     st.is_displaying = false;
                 }
-                let should_override = st.device_battery.should_override_clock();
+                st.laptop_battery = battery::get_host_battery();
+                let critical_threshold = st.config.laptop_battery.critical_threshold;
+                let should_override = st
+                    .laptop_battery
+                    .as_ref()
+                    .is_some_and(|b| b.should_override_clock_with_threshold(critical_threshold));
                 st.is_battery_override = should_override;
-                (st.device.clone(), should_override, st.device_battery.percent)
+                (
+                    st.device.clone(),
+                    should_override,
+                    st.laptop_battery.clone(),
+                )
             };
 
             if let Some(dev) = dev_opt {
-                if should_override {
-                    log::warn!("Queue empty, but device battery is critical (<10% and not charging). Showing battery icon instead of clock.");
-                    let canvas = Canvas::render_battery(bat_percent, false, true);
+                if should_override && let Some(bat) = bat_info {
+                    log::warn!(
+                        "Queue empty, but laptop battery is critical (<10% and not charging). Showing battery icon instead of clock."
+                    );
+                    let canvas = Canvas::render_battery(bat.percent, bat.is_charging, true);
                     if let Ok(temp_path) = canvas.to_temp_png() {
                         let _ = dev.show_image(temp_path.clone()).await;
                         let _ = fs::remove_file(temp_path);
@@ -805,7 +879,12 @@ async fn worker_loop(state: Arc<Mutex<DaemonState>>, rx_notify: &mut mpsc::Recei
 }
 
 async fn process_notification(item: &NotificationItem, state: &Arc<Mutex<DaemonState>>) {
-    log::info!("Displaying notification: '{}' (icon: {:?}, priority: {:?})", item.message, item.icon, item.priority);
+    log::info!(
+        "Displaying notification: '{}' (icon: {:?}, priority: {:?})",
+        item.message,
+        item.icon,
+        item.priority
+    );
 
     let (dev, sound_cmd) = {
         let mut st = state.lock().await;
@@ -858,16 +937,17 @@ async fn process_notification(item: &NotificationItem, state: &Arc<Mutex<DaemonS
     // Display icon or text
     let mut displayed = false;
     if let Some(icon_name) = &item.icon
-        && let Some(resolved) = icons::resolve_icon(icon_name) {
-            match resolved.display(&dev).await {
-                Ok(_) => {
-                    displayed = true;
-                }
-                Err(e) => {
-                    log::warn!("Failed to display resolved icon '{icon_name}': {e}");
-                }
+        && let Some(resolved) = icons::resolve_icon(icon_name)
+    {
+        match resolved.display(&dev).await {
+            Ok(_) => {
+                displayed = true;
+            }
+            Err(e) => {
+                log::warn!("Failed to display resolved icon '{icon_name}': {e}");
             }
         }
+    }
 
     if !displayed {
         // Fall back to static text display

@@ -6,15 +6,20 @@ fn main() {
 
     // 1. Sysmon (CPU 42%, RAM 58%)
     let sysmon = Canvas::render_sysmon(42, 58);
-    sysmon.save_png(Path::new("target/screens/sysmon.png")).unwrap();
+    sysmon
+        .save_png(Path::new("target/screens/sysmon.png"))
+        .unwrap();
 
     // 2. Battery (85%, Charging)
     let battery = Canvas::render_battery(85, true, false);
-    battery.save_png(Path::new("target/screens/battery.png")).unwrap();
+    battery
+        .save_png(Path::new("target/screens/battery.png"))
+        .unwrap();
 
     // 3. Disk Warning (88%)
     let disk = Canvas::render_gauge("DISK", 88, 100, [239, 68, 68]);
-    disk.save_png(Path::new("target/screens/disk_warning.png")).unwrap();
+    disk.save_png(Path::new("target/screens/disk_warning.png"))
+        .unwrap();
 
     // 4. Authentic Native Ditoo Clock face: matching physical Ditoo Pro hardware
     // Hours (20) on top; blinking colon on bottom-left, minutes (20) on bottom-right
@@ -48,7 +53,9 @@ fn main() {
         }
     }
 
-    clock.save_png(Path::new("target/screens/clock.png")).unwrap();
+    clock
+        .save_png(Path::new("target/screens/clock.png"))
+        .unwrap();
 
     println!("Saved 16x16 raw screens to target/screens/");
 }

@@ -28,8 +28,8 @@ pub struct Config {
     #[serde(default)]
     pub sysmon: SysmonConfig,
 
-    #[serde(default)]
-    pub device_battery: DeviceBatteryConfig,
+    #[serde(default, alias = "device_battery")]
+    pub laptop_battery: LaptopBatteryConfig,
 }
 
 fn default_duration() -> f64 {
@@ -191,7 +191,7 @@ fn default_sysmon_alert_duration() -> f64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceBatteryConfig {
+pub struct LaptopBatteryConfig {
     #[serde(default = "default_low_threshold")]
     pub low_threshold: u8,
     #[serde(default = "default_critical_threshold")]
@@ -200,7 +200,9 @@ pub struct DeviceBatteryConfig {
     pub warn_cooldown_mins: u64,
 }
 
-impl Default for DeviceBatteryConfig {
+pub type DeviceBatteryConfig = LaptopBatteryConfig;
+
+impl Default for LaptopBatteryConfig {
     fn default() -> Self {
         Self {
             low_threshold: default_low_threshold(),
@@ -233,7 +235,7 @@ impl Default for Config {
             sync_interval_mins: default_sync_interval(),
             desktop_monitor: DesktopMonitorConfig::default(),
             sysmon: SysmonConfig::default(),
-            device_battery: DeviceBatteryConfig::default(),
+            laptop_battery: LaptopBatteryConfig::default(),
         }
     }
 }
@@ -269,9 +271,10 @@ impl Config {
         let path = Self::config_path();
         if path.exists()
             && let Ok(content) = fs::read_to_string(&path)
-                && let Ok(cfg) = serde_json::from_str(&content) {
-                    return cfg;
-                }
+            && let Ok(cfg) = serde_json::from_str(&content)
+        {
+            return cfg;
+        }
         Config::default()
     }
 

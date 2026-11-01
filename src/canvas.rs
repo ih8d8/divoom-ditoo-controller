@@ -1,9 +1,9 @@
+use image::{ImageBuffer, Rgb};
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use image::{ImageBuffer, Rgb};
-use serde::{Deserialize, Serialize};
 
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -29,7 +29,10 @@ pub fn get_secure_runtime_temp_dir() -> std::io::Result<PathBuf> {
 
 /// Creates a new temporary file with mode 0600 (owner read/write only)
 /// using O_CREAT | O_EXCL to eliminate symlink attacks and race conditions.
-pub fn create_secure_temp_file(prefix: &str, extension: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+pub fn create_secure_temp_file(
+    prefix: &str,
+    extension: &str,
+) -> std::io::Result<(PathBuf, std::fs::File)> {
     let dir = get_secure_runtime_temp_dir()?;
     let pid = std::process::id();
     let mut attempts = 0;
@@ -63,9 +66,24 @@ pub const CANVAS_WIDTH: usize = 16;
 pub const CANVAS_HEIGHT: usize = 16;
 
 pub fn parse_color(s: &str) -> Result<[u8; 3], String> {
-    let c = csscolorparser::parse(s).map_err(|e| format!("Invalid color '{s}': {e}"))?;
-    let [r, g, b, _] = c.to_rgba8();
-    Ok([r, g, b])
+    let trimmed = s.trim();
+    let lower = trimmed.to_lowercase();
+    match lower.as_str() {
+        "amber" => Ok([255, 191, 0]),
+        _ => {
+            let to_parse = if (trimmed.len() == 6 || trimmed.len() == 3 || trimmed.len() == 8)
+                && trimmed.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                format!("#{trimmed}")
+            } else {
+                trimmed.to_string()
+            };
+            let c = csscolorparser::parse(&to_parse)
+                .map_err(|e| format!("Invalid color '{s}': {e}"))?;
+            let [r, g, b, _] = c.to_rgba8();
+            Ok([r, g, b])
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,7 +312,8 @@ impl Canvas {
 
     /// Save to PNG file path
     pub fn save_png(&self, path: &Path) -> Result<(), String> {
-        let mut img = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(CANVAS_WIDTH as u32, CANVAS_HEIGHT as u32);
+        let mut img =
+            ImageBuffer::<Rgb<u8>, Vec<u8>>::new(CANVAS_WIDTH as u32, CANVAS_HEIGHT as u32);
         for y in 0..CANVAS_HEIGHT {
             for x in 0..CANVAS_WIDTH {
                 let [r, g, b] = self.get_pixel(x, y);
@@ -310,7 +329,8 @@ impl Canvas {
         let (temp_path, mut file) = create_secure_temp_file("ditoo_canvas", "png")
             .map_err(|e| format!("Failed to create secure temp file: {e}"))?;
 
-        let mut img = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(CANVAS_WIDTH as u32, CANVAS_HEIGHT as u32);
+        let mut img =
+            ImageBuffer::<Rgb<u8>, Vec<u8>>::new(CANVAS_WIDTH as u32, CANVAS_HEIGHT as u32);
         for y in 0..CANVAS_HEIGHT {
             for x in 0..CANVAS_WIDTH {
                 let [r, g, b] = self.get_pixel(x, y);

@@ -7,7 +7,7 @@
 
 A lightweight, non-invasive Linux integration and CLI controller for the **Divoom Ditoo Pro** retro Bluetooth speaker and 16×16 pixel-art display.
 
-The controller idles the Ditoo Pro on its native digital clock face (styled in emerald green), intercepts desktop notifications from any **FreeDesktop notification system** (such as Dunst, Quickshell, Mako, or SwayNC), renders crisp 16×16 pixel typography and icons, provides intelligent low-battery warnings, monitors Linux system resources (CPU/RAM), and automatically returns to the clock.
+The controller idles the Ditoo Pro on its native digital clock face (styled in emerald green), intercepts desktop notifications from any **FreeDesktop notification system** (such as Dunst, Quickshell, Mako, or SwayNC), renders crisp 16×16 pixel typography and icons, provides host laptop battery monitoring & alerts, monitors Linux system resources (CPU/RAM), and automatically returns to the clock.
 
 > [!NOTE]
 > **Tested & Developed on Arch Linux**: This project was developed and extensively tested on **Arch Linux** (Linux kernel 6.12+ / 6.17+, BlueZ 5.79+, Hyprland, Dunst, Quickshell, PipeWire / WirePlumber). It is completely distro-agnostic and runs on Fedora, Ubuntu, Debian, NixOS, or any Linux distribution supporting BlueZ 5+ and D-Bus.
@@ -22,7 +22,7 @@ The controller idles the Ditoo Pro on its native digital clock face (styled in e
   <br/><br/>
 
   <img src="assets/screenshots/screens_showcase.png" width="684" alt="Divoom Ditoo Live Display Screens" /><br/>
-  <sub><em>Physical Display Screens: Emerald RTC Clock, Live CPU/RAM Sysmon, Device Battery Charging, and Critical Disk Alert</em></sub>
+  <sub><em>Physical Display Screens: Emerald RTC Clock, Live CPU/RAM Sysmon, Laptop Battery Monitor, and Critical Disk Alert</em></sub>
   <br/><br/>
 
   <img src="assets/screenshots/icons_grid.png" width="684" alt="Divoom Ditoo Built-in 16x16 Pixel Art Icon Catalog" /><br/>
@@ -38,10 +38,11 @@ The controller idles the Ditoo Pro on its native digital clock face (styled in e
   - The notification monitor listens directly to standard FreeDesktop D-Bus calls (`org.freedesktop.Notifications.Notify`).
   - **Dunst vs Quickshell vs Mako**: Works with **any** notification system out of the box! Switching from Dunst to a custom Quickshell widget, SwayNC, or `notify-send` requires zero configuration changes.
 - **Dynamic Bluetooth Auto-Discovery**: Zero hardcoded MAC addresses. Automatically discovers and pairs with any Divoom/Ditoo device via BlueZ D-Bus, with support for `$DITOO_MAC` or `~/.config/ditoo/config.json`.
-- **Intelligent Battery Tracking**:
-  - Queries device battery level directly via BlueZ D-Bus (`org.bluez.Battery1`) or connection session modeling.
-  - **Smart Clock Override**: When device battery drops below **10%**, the display automatically replaces the idle clock with a flashing low-battery alert icon to warn you to charge it.
-  - **Charging Awareness**: Plugging the device into a charger instantly dismisses the low-battery warning and restores the clock face, even if the battery has not yet reached 10%.
+- **Host Laptop Battery Monitor**:
+  - Automatically queries host laptop battery percentage and charging state directly via Linux sysfs (`/sys/class/power_supply/BAT*`).
+  - **Smart Clock Override**: When your laptop battery drops below **10%**, the display automatically replaces the idle clock with a flashing low-battery alert icon to warn you to plug in your laptop.
+  - **Charging Awareness**: Plugging the laptop into AC power instantly dismisses the low-battery warning and restores the clock face.
+  - *(Desktop Safe)*: On desktop PCs without a battery, battery monitoring is cleanly bypassed with zero false alarms.
 - **Zero-Overhead System Resource Monitor (Sysmon)**:
   - Reads directly from Linux procfs (`/proc/stat`, `/proc/meminfo`) and POSIX `statvfs` — zero external binary dependencies and negligible CPU overhead (<0.1ms).
   - Displays crisp CPU, RAM, and Disk metrics on the 16×16 screen.
@@ -222,18 +223,15 @@ ditoo showcase
 ditoo showcase --interval 3
 ```
 
-### Device Battery Monitor
+### Laptop Battery Monitor
 ```bash
-# Query device battery percentage and charging state via BlueZ D-Bus
+# Query and display host laptop battery status on the 16x16 screen (5s duration)
 ditoo battery
 
-# Display battery level card on the 16x16 screen (5s duration)
-ditoo battery
-
-# Only print battery status to terminal without updating the display
+# Only print laptop battery status to terminal without updating the display
 ditoo battery --status-only
 
-# Manually report battery state (e.g. 15% charging)
+# Preview/test battery widget with a custom percentage (e.g. 15% charging)
 ditoo battery 15 --charging
 ```
 

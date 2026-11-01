@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::fs;
 use std::mem::MaybeUninit;
-use serde::{Deserialize, Serialize};
 
 /// Point-in-time snapshot of CPU tick counters from /proc/stat
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

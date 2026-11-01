@@ -398,7 +398,7 @@ fn resolve_font(font: Option<&str>) -> Result<PathBuf, Box<dyn Error>> {
       let fc = fontconfig::Fontconfig::new()
         .ok_or("Failed to initialize fontconfig")?;
       let font = fc.find(name_or_path, None)
-        .ok_or_else(|| format!("Font {:?} not found", name_or_path))?;
+        .map_err(|e| format!("Font {:?} not found: {e}", name_or_path))?;
       Ok(font.path.clone())
     }
     None => {
@@ -408,7 +408,7 @@ fn resolve_font(font: Option<&str>) -> Result<PathBuf, Box<dyn Error>> {
       let fc = fontconfig::Fontconfig::new()
         .ok_or("Failed to initialize fontconfig")?;
       let font = fc.find("monospace", None)
-        .ok_or("No monospace font found; use --font")?;
+        .map_err(|_| "No monospace font found; use --font")?;
       Ok(font.path.clone())
     }
   }

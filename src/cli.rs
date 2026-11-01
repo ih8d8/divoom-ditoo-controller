@@ -8,7 +8,7 @@ use crate::integrations;
 use crate::sysmon;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueHint};
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 use env_logger::{Builder, Env};
 use std::error::Error;
 use std::path::PathBuf;
@@ -17,7 +17,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 #[derive(Parser, Debug)]
-#[command(name = "ditoo", author, version, about = "Divoom Ditoo Pro Arch Linux Notification & Display Controller")]
+#[command(
+    name = "ditoo",
+    author,
+    version,
+    about = "Divoom Ditoo Pro Arch Linux Notification & Display Controller"
+)]
 struct Cli {
     #[arg(short, long, global = true)]
     verbose: bool,
@@ -53,17 +58,17 @@ enum Commands {
         state: String,
     },
 
-    /// Display or update Divoom Ditoo Pro device battery status and level
+    /// Display host laptop battery status on Divoom Ditoo Pro
     Battery {
-        /// Set/update device battery percentage (0-100). If omitted, displays current device battery state
+        /// Battery percentage override (0-100). If omitted, displays host laptop battery state
         #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
         percent: Option<u8>,
 
-        /// Mark Ditoo Pro device as plugged in / charging
+        /// Mark battery as plugged in / charging
         #[arg(short, long)]
         charging: bool,
 
-        /// Mark Ditoo Pro device as running on battery (not charging)
+        /// Mark battery as running on battery (not charging)
         #[arg(long)]
         not_charging: bool,
 
@@ -179,7 +184,7 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ShowCommands {
-    /// Show battery widget (reads system or uses percentage)
+    /// Show battery widget (reads host laptop battery or uses specified percentage)
     Battery {
         #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
         percent: Option<u8>,
@@ -313,7 +318,10 @@ enum ShowCommands {
     },
 }
 
-async fn display_canvas(canvas_type: CanvasType, duration: Option<f64>) -> Result<(), Box<dyn Error>> {
+async fn display_canvas(
+    canvas_type: CanvasType,
+    duration: Option<f64>,
+) -> Result<(), Box<dyn Error>> {
     // 1. Try sending to daemon first via Unix socket
     if let Ok(mut stream) = UnixStream::connect(daemon::socket_path()).await {
         let cmd = DaemonCommand::Display {
@@ -327,7 +335,9 @@ async fn display_canvas(canvas_type: CanvasType, duration: Option<f64>) -> Resul
     }
 
     // 2. Direct fallback execution
-    let canvas = canvas_type.render().map_err(|e| format!("Render error: {e}"))?;
+    let canvas = canvas_type
+        .render()
+        .map_err(|e| format!("Render error: {e}"))?;
     let temp_path = canvas.to_temp_png()?;
     let config = Config::load();
     let (dev, _) = device::spawn_device_worker(config.device_mac).await?;
@@ -458,7 +468,10 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
                 let cmd = DaemonCommand::Screen { on };
                 let json = serde_json::to_string(&cmd)?;
                 stream.write_all(format!("{json}\n").as_bytes()).await?;
-                println!("Screen power set to {} via daemon.", if on { "ON" } else { "OFF" });
+                println!(
+                    "Screen power set to {} via daemon.",
+                    if on { "ON" } else { "OFF" }
+                );
                 return Ok(());
             }
 
@@ -498,43 +511,71 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
                 let mut reader = BufReader::new(stream).lines();
                 if let Some(line) = reader.next_line().await? {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
-                        && let Some(bat) = val.get("battery") {
-                            let pct = bat.get("percent").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let chg = bat.get("is_charging").and_then(|v| v.as_bool()).unwrap_or(false);
-                            let chg_str = if chg { " [Charging ⚡]" } else { "" };
-                            println!("Ditoo Pro Battery: {pct}%{chg_str}");
-                            if pct < 10 && !chg {
-                                println!("⚠️  BATTERY CRITICAL (<10%): Battery alert screen is active until device is plugged in.");
-                            } else if pct <= 20 && !chg {
-                                println!("⚠️  Low battery warning (<=20%). Please recharge soon.");
-                            }
+                        && let Some(bat) = val.get("battery")
+                    {
+                        if bat.is_null() {
+                            println!(
+                                "No host laptop battery detected (/sys/class/power_supply/BAT*)."
+                            );
                             return Ok(());
                         }
+                        let pct = bat.get("percent").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let chg = bat
+                            .get("is_charging")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let chg_str = if chg { " [Charging ⚡]" } else { "" };
+                        println!("Laptop Battery: {pct}%{chg_str}");
+                        if pct < 10 && !chg {
+                            println!(
+                                "⚠️  BATTERY CRITICAL (<10%): Laptop battery alert screen is active until plugged in."
+                            );
+                        } else if pct <= 20 && !chg {
+                            println!("⚠️  Low battery warning (<=20%). Please recharge soon.");
+                        }
+                        return Ok(());
+                    }
                     println!("{line}");
                 }
                 return Ok(());
             }
 
             // 2. Direct offline fallback
-            let mut state = battery::DeviceBatteryState::load();
-            if let Some(p) = percent {
-                state.percent = p;
-            }
-            if let Some(c) = charging_opt {
-                state.is_charging = c;
-            }
-            if percent.is_some() || charging_opt.is_some() {
-                state.updated_at = chrono::Local::now();
-                let _ = state.save();
+            let host_bat = battery::get_host_battery();
+            let (pct, chg, is_low) = if let Some(p) = percent {
+                let c = charging_opt.unwrap_or(false);
+                let l = low || (p <= 20 && !c);
+                (p, c, l)
+            } else if let Some(b) = host_bat {
+                let c = charging_opt.unwrap_or(b.is_charging);
+                let l = low || (b.percent <= 20 && !c);
+                println!("{}", b.description());
+                if b.is_critical() {
+                    println!(
+                        "⚠️  BATTERY CRITICAL (<10%): Laptop battery alert screen is active until plugged in."
+                    );
+                } else if b.is_low() {
+                    println!("⚠️  Low battery warning (<=20%). Please recharge soon.");
+                }
+                (b.percent, c, l)
+            } else {
+                println!("No host laptop battery detected (/sys/class/power_supply/BAT*).");
+                return Ok(());
+            };
+
+            if percent.is_some() {
+                println!(
+                    "Laptop Battery (override): {pct}%{}",
+                    if chg { " [Charging ⚡]" } else { "" }
+                );
             }
 
-            println!("{}", state.description());
             if !status_only {
                 display_canvas(
                     CanvasType::Battery {
-                        percent: state.percent,
-                        charging: state.is_charging,
-                        is_low: low || state.is_low(),
+                        percent: pct,
+                        charging: chg,
+                        is_low,
                     },
                     duration,
                 )
@@ -542,7 +583,10 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        Commands::Sysmon { duration, status_only } => {
+        Commands::Sysmon {
+            duration,
+            status_only,
+        } => {
             // 1. Try sending via daemon socket
             if let Ok(mut stream) = UnixStream::connect(daemon::socket_path()).await {
                 let cmd = DaemonCommand::Sysmon {
@@ -555,23 +599,36 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
                 let mut reader = BufReader::new(stream).lines();
                 if let Some(line) = reader.next_line().await? {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
-                        && let Some(s) = val.get("sysmon") {
-                            let cpu = s.get("cpu_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            let ram = s.get("ram_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            let used = s.get("ram_used_mb").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let total = s.get("ram_total_mb").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let disk = s.get("disk_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            let disk_used = s.get("disk_used_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            let disk_total = s.get("disk_total_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            println!("Linux System Monitor:");
-                            println!("  CPU Usage : {:.1}%", cpu);
-                            println!("  RAM Usage : {:.1}% ({}/{} MB)", ram, used, total);
-                            println!("  Disk Usage: {:.1}% ({:.1}/{:.1} GB)", disk, disk_used, disk_total);
-                            if disk >= 85.0 {
-                                println!("  ⚠️  WARNING: Disk usage is critical ({:.1}% >= 85%)!", disk);
-                            }
-                            return Ok(());
+                        && let Some(s) = val.get("sysmon")
+                    {
+                        let cpu = s.get("cpu_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let ram = s.get("ram_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let used = s.get("ram_used_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let total = s.get("ram_total_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let disk = s.get("disk_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let disk_used = s
+                            .get("disk_used_gb")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let disk_total = s
+                            .get("disk_total_gb")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        println!("Linux System Monitor:");
+                        println!("  CPU Usage : {:.1}%", cpu);
+                        println!("  RAM Usage : {:.1}% ({}/{} MB)", ram, used, total);
+                        println!(
+                            "  Disk Usage: {:.1}% ({:.1}/{:.1} GB)",
+                            disk, disk_used, disk_total
+                        );
+                        if disk >= 85.0 {
+                            println!(
+                                "  ⚠️  WARNING: Disk usage is critical ({:.1}% >= 85%)!",
+                                disk
+                            );
                         }
+                        return Ok(());
+                    }
                     println!("{line}");
                 }
                 return Ok(());
@@ -581,10 +638,19 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
             let snap = sysmon::read_instant_snapshot();
             println!("Linux System Monitor:");
             println!("  CPU Usage : {:.1}%", snap.cpu_pct);
-            println!("  RAM Usage : {:.1}% ({}/{} MB)", snap.ram_pct, snap.ram_used_mb, snap.ram_total_mb);
-            println!("  Disk Usage: {:.1}% ({:.1}/{:.1} GB)", snap.disk_pct, snap.disk_used_gb, snap.disk_total_gb);
+            println!(
+                "  RAM Usage : {:.1}% ({}/{} MB)",
+                snap.ram_pct, snap.ram_used_mb, snap.ram_total_mb
+            );
+            println!(
+                "  Disk Usage: {:.1}% ({:.1}/{:.1} GB)",
+                snap.disk_pct, snap.disk_used_gb, snap.disk_total_gb
+            );
             if snap.disk_pct >= 85.0 {
-                println!("  ⚠️  WARNING: Disk usage is critical ({:.1}% >= 85%)!", snap.disk_pct);
+                println!(
+                    "  ⚠️  WARNING: Disk usage is critical ({:.1}% >= 85%)!",
+                    snap.disk_pct
+                );
             }
 
             if !status_only {
@@ -606,12 +672,25 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
                 low,
                 duration,
             } => {
-                let state = battery::DeviceBatteryState::load();
-                let pct = percent.unwrap_or(state.percent);
-                let chg = charging || state.is_charging;
-                let is_low = low || (pct <= 20 && !chg);
+                let host_bat = battery::get_host_battery();
+                let (pct, chg, is_low) = if let Some(p) = percent {
+                    let c = charging;
+                    let l = low || (p <= 20 && !c);
+                    (p, c, l)
+                } else if let Some(b) = host_bat {
+                    let c = charging || b.is_charging;
+                    let l = low || (b.percent <= 20 && !c);
+                    (b.percent, c, l)
+                } else {
+                    println!(
+                        "No host laptop battery detected (/sys/class/power_supply/BAT*). Specify --percent <0-100> to test display."
+                    );
+                    return Ok(());
+                };
 
-                println!("Displaying Ditoo Pro battery: {pct}% (charging: {chg}, low_warning: {is_low})...");
+                println!(
+                    "Displaying laptop battery: {pct}% (charging: {chg}, low_warning: {is_low})..."
+                );
                 display_canvas(
                     CanvasType::Battery {
                         percent: pct,
@@ -627,12 +706,22 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
                     (Some(c), Some(r)) => (c, r),
                     _ => {
                         let snap = sysmon::read_instant_snapshot();
-                        (cpu.unwrap_or(snap.cpu_pct as u32), ram.unwrap_or(snap.ram_pct as u32))
+                        (
+                            cpu.unwrap_or(snap.cpu_pct as u32),
+                            ram.unwrap_or(snap.ram_pct as u32),
+                        )
                     }
                 };
 
                 println!("Displaying dual Sysmon: CPU {cpu_val}%, RAM {ram_val}%...");
-                display_canvas(CanvasType::Sysmon { cpu: cpu_val, ram: ram_val }, duration).await?;
+                display_canvas(
+                    CanvasType::Sysmon {
+                        cpu: cpu_val,
+                        ram: ram_val,
+                    },
+                    duration,
+                )
+                .await?;
             }
             ShowCommands::Cpu { cpu, duration } => {
                 let cpu_val = match cpu {
@@ -642,7 +731,13 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
                         snap.cpu_pct as u32
                     }
                 };
-                let color = if cpu_val >= 90 { "red" } else if cpu_val >= 75 { "amber" } else { "green" };
+                let color = if cpu_val >= 90 {
+                    "red"
+                } else if cpu_val >= 75 {
+                    "amber"
+                } else {
+                    "green"
+                };
                 println!("Displaying CPU gauge: {cpu_val}% [{color}]...");
                 display_canvas(
                     CanvasType::Gauge {
@@ -663,7 +758,13 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
                         snap.ram_pct as u32
                     }
                 };
-                let color = if ram_val >= 90 { "red" } else if ram_val >= 75 { "magenta" } else { "cyan" };
+                let color = if ram_val >= 90 {
+                    "red"
+                } else if ram_val >= 75 {
+                    "magenta"
+                } else {
+                    "cyan"
+                };
                 println!("Displaying RAM gauge: {ram_val}% [{color}]...");
                 display_canvas(
                     CanvasType::Gauge {
@@ -684,7 +785,13 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
                         snap.disk_pct as u32
                     }
                 };
-                let color = if disk_val >= 85 { "red" } else if disk_val >= 70 { "amber" } else { "cyan" };
+                let color = if disk_val >= 85 {
+                    "red"
+                } else if disk_val >= 70 {
+                    "amber"
+                } else {
+                    "cyan"
+                };
                 println!("Displaying DISK gauge: {disk_val}% [{color}]...");
                 display_canvas(
                     CanvasType::Gauge {
@@ -806,9 +913,10 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
             let mut displayed = false;
             if let Some(ref icon_name) = icon
                 && let Some(resolved) = icons::resolve_icon(icon_name)
-                    && resolved.display(&dev).await.is_ok() {
-                        displayed = true;
-                    }
+                && resolved.display(&dev).await.is_ok()
+            {
+                displayed = true;
+            }
 
             if !displayed {
                 let color = match priority {
@@ -898,19 +1006,40 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
             ];
 
             let total = items.len() + 3;
-            println!("✨ Starting Ditoo icon showcase (cycling {total} items, {interval:.1}s each)...");
+            println!(
+                "✨ Starting Ditoo icon showcase (cycling {total} items, {interval:.1}s each)..."
+            );
             for (idx, (name, desc)) in items.iter().enumerate() {
-                println!("[{}/{}] Showing icon: '{}' — {} ({:.1}s)", idx + 1, total, name, desc, interval);
+                println!(
+                    "[{}/{}] Showing icon: '{}' — {} ({:.1}s)",
+                    idx + 1,
+                    total,
+                    name,
+                    desc,
+                    interval
+                );
                 if let Some(resolved) = icons::resolve_icon(name)
-                    && let Err(e) = resolved.display(&dev).await {
-                        eprintln!("Failed to display {name}: {e}");
-                    }
+                    && let Err(e) = resolved.display(&dev).await
+                {
+                    eprintln!("Failed to display {name}: {e}");
+                }
                 tokio::time::sleep(Duration::from_secs_f64(interval.max(1.0))).await;
             }
 
             // Also showcase dynamic battery canvas
-            println!("[{}/{}] Showing dynamic canvas: 'battery' (85% Charging)...", total - 2, total);
-            let bat_canvas = Canvas::render_battery(85, true, false);
+            let (demo_pct, demo_chg) = if let Some(bat) = battery::get_host_battery() {
+                (bat.percent, bat.is_charging)
+            } else {
+                (85, true)
+            };
+            println!(
+                "[{}/{}] Showing dynamic canvas: 'battery' ({}%{})...",
+                total - 2,
+                total,
+                demo_pct,
+                if demo_chg { " Charging" } else { "" }
+            );
+            let bat_canvas = Canvas::render_battery(demo_pct, demo_chg, false);
             if let Ok(temp) = bat_canvas.to_temp_png() {
                 let _ = dev.show_image(temp.clone()).await;
                 let _ = std::fs::remove_file(temp);
@@ -918,7 +1047,11 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
             tokio::time::sleep(Duration::from_secs_f64(interval.max(1.0))).await;
 
             // Also showcase dynamic sysmon canvas
-            println!("[{}/{}] Showing dynamic canvas: 'sysmon' (Live CPU & RAM)...", total - 1, total);
+            println!(
+                "[{}/{}] Showing dynamic canvas: 'sysmon' (Live CPU & RAM)...",
+                total - 1,
+                total
+            );
             let snap = sysmon::read_instant_snapshot();
             let sysmon_canvas = Canvas::render_sysmon(snap.cpu_pct as u32, snap.ram_pct as u32);
             if let Ok(temp) = sysmon_canvas.to_temp_png() {
@@ -928,7 +1061,10 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
             tokio::time::sleep(Duration::from_secs_f64(interval.max(1.0))).await;
 
             // Also showcase dynamic disk canvas
-            println!("[{}/{}] Showing dynamic canvas: 'disk' (88% Warning)...", total, total);
+            println!(
+                "[{}/{}] Showing dynamic canvas: 'disk' (88% Warning)...",
+                total, total
+            );
             let disk_canvas = Canvas::render_gauge("DISK", 88, 100, [239, 68, 68]);
             if let Ok(temp) = disk_canvas.to_temp_png() {
                 let _ = dev.show_image(temp.clone()).await;
@@ -957,7 +1093,9 @@ pub async fn run_cli() -> Result<(), Box<dyn Error>> {
 fn install_completions(shell: Shell) -> Result<(), Box<dyn Error>> {
     match shell {
         Shell::Bash => {
-            let dir = crate::config::resolve_data_dir().join("bash-completion").join("completions");
+            let dir = crate::config::resolve_data_dir()
+                .join("bash-completion")
+                .join("completions");
             std::fs::create_dir_all(&dir)?;
 
             let ditoo_file = dir.join("ditoo");
@@ -970,12 +1108,21 @@ fn install_completions(shell: Shell) -> Result<(), Box<dyn Error>> {
             let mut cmd2 = Cli::command();
             generate(Shell::Bash, &mut cmd2, "divoom-ditoo-controller", &mut f2);
 
-            println!("✅ Bash completions installed to:\n  • {}\n  • {}", ditoo_file.display(), controller_file.display());
+            println!(
+                "✅ Bash completions installed to:\n  • {}\n  • {}",
+                ditoo_file.display(),
+                controller_file.display()
+            );
             println!("Completions will automatically load in all new Bash interactive sessions.");
-            println!("To test immediately in your current shell, run:\n  source {}", ditoo_file.display());
+            println!(
+                "To test immediately in your current shell, run:\n  source {}",
+                ditoo_file.display()
+            );
         }
         Shell::Zsh => {
-            let dir = crate::config::resolve_data_dir().join("zsh").join("site-functions");
+            let dir = crate::config::resolve_data_dir()
+                .join("zsh")
+                .join("site-functions");
             std::fs::create_dir_all(&dir)?;
 
             let file = dir.join("_ditoo");
@@ -985,7 +1132,9 @@ fn install_completions(shell: Shell) -> Result<(), Box<dyn Error>> {
             println!("✅ Zsh completions installed to: {}", file.display());
         }
         Shell::Fish => {
-            let dir = crate::config::resolve_config_dir().join("fish").join("completions");
+            let dir = crate::config::resolve_config_dir()
+                .join("fish")
+                .join("completions");
             std::fs::create_dir_all(&dir)?;
 
             let file = dir.join("ditoo.fish");

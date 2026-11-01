@@ -134,7 +134,7 @@ def main():
     screens = [
         ("target/screens/clock.png", "Native Clock", "Emerald Green RTC"),
         ("target/screens/sysmon.png", "CPU & RAM Mon", "C 42% | R 58%"),
-        ("target/screens/battery.png", "Device Battery", "85% Charging ⚡"),
+        ("target/screens/battery.png", "Laptop Battery", "85% Charging ⚡"),
         ("target/screens/disk_warning.png", "Disk Warning", "88% Storage Alert"),
     ]
 

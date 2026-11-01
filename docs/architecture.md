@@ -21,7 +21,7 @@ flowchart TD
         Mon -->|ditoo notify / clock / sync-time| CLI_Handler["CLI & Daemon IPC Layer"]
         CLI_Handler --> IconEngine["Multi-Tier Icon & Asset Resolver"]
         CLI_Handler --> CanvasEngine["Generalized 16x16 Canvas & Badge Engine"]
-        CLI_Handler --> BatMon["Intelligent Device Battery State Engine"]
+        CLI_Handler --> BatMon["Host Laptop Battery Sysfs Monitor"]
         CLI_Handler --> SysMon["Host CPU & RAM Procfs Monitor"]
         CLI_Handler --> UpstreamProto["Upstream Protocol & RFCOMM Framing (futpib/divoom-ditoo-pro-controller)"]
         AutoDiscovery["Dynamic BlueZ D-Bus Discovery"] -.-> UpstreamProto
@@ -53,10 +53,11 @@ flowchart TD
    - When an incoming notification or widget is displayed, it shows for a configurable duration (default 5 seconds), then automatically restores the native clock (`0x45`).
    - The RTC clock is synchronized to Linux system time automatically on connection and hourly (`0x18`).
 
-4. **Intelligent Device Battery Management**:
-   - Device battery is tracked continuously via BlueZ D-Bus (`org.bluez.Battery1`) and connection session discharge models.
-   - **Critical Threshold (<10%)**: Replaces the clock with an explicit low-battery warning canvas so the user is prompted to plug it in before shutdown.
-   - **Smart Charging Override**: Plugging the device in instantly restores the clock, even if the battery has not yet reached 10%.
+4. **Host Laptop Battery Monitoring**:
+   - Laptop battery is tracked continuously via Linux sysfs (`/sys/class/power_supply/BAT*`).
+   - **Critical Threshold (<10%)**: Replaces the clock with an explicit low-battery warning canvas so the user is prompted to plug in their laptop charger before shutdown.
+   - **Smart Charging Override**: Plugging the laptop into AC power instantly restores the clock face.
+   - On desktop PCs without a battery, battery checks return `None` and are cleanly bypassed.
 
 5. **Extensible Plugin & Asset System (`~/.config/ditoo/icons/`)**:
    - All custom pixel-art icons are located in `$XDG_CONFIG_HOME/ditoo/icons/` (`~/.config/ditoo/icons/<name>.png`).

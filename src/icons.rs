@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use crate::canvas::Canvas;
+use std::path::{Path, PathBuf};
 
 // --- Embedded 16x16 Pixel Art Assets ---
 pub static ICON_DONE: &[u8] = include_bytes!("../assets/icons/done.png");
@@ -44,7 +44,10 @@ pub enum ResolvedIcon {
 
 impl ResolvedIcon {
     /// Render and send the icon to the physical Ditoo Pro device
-    pub async fn display(&self, dev: &crate::device::DeviceHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn display(
+        &self,
+        dev: &crate::device::DeviceHandle,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self {
             ResolvedIcon::FilePath(path) => {
                 if path.extension().and_then(|e| e.to_str()) == Some("divoom16") {
@@ -81,27 +84,15 @@ pub fn get_embedded_icon(name: &str) -> Option<IconType> {
         "done" | "ok" | "success" | "check" | "finished" | "complete" => {
             Some(IconType::ImageBytes(ICON_DONE))
         }
-        "info" | "default" | "msg" | "note" | "notice" => {
-            Some(IconType::ImageBytes(ICON_INFO))
-        }
-        "error" | "fail" | "failed" | "cross" | "bug" => {
-            Some(IconType::ImageBytes(ICON_ERROR))
-        }
+        "info" | "default" | "msg" | "note" | "notice" => Some(IconType::ImageBytes(ICON_INFO)),
+        "error" | "fail" | "failed" | "cross" | "bug" => Some(IconType::ImageBytes(ICON_ERROR)),
         "alert" | "warn" | "warning" | "approval" | "prompt" | "question" => {
             Some(IconType::ImageBytes(ICON_ALERT))
         }
-        "bell" | "chime" | "ding" | "remind" => {
-            Some(IconType::ImageBytes(ICON_BELL))
-        }
-        "claude" | "claude-code" => {
-            Some(IconType::ImageBytes(ICON_CLAUDE))
-        }
-        "codex" | "openai" => {
-            Some(IconType::ImageBytes(ICON_CODEX))
-        }
-        "antigravity" | "agy" | "deepmind" => {
-            Some(IconType::ImageBytes(ICON_ANTIGRAVITY))
-        }
+        "bell" | "chime" | "ding" | "remind" => Some(IconType::ImageBytes(ICON_BELL)),
+        "claude" | "claude-code" => Some(IconType::ImageBytes(ICON_CLAUDE)),
+        "codex" | "openai" => Some(IconType::ImageBytes(ICON_CODEX)),
+        "antigravity" | "agy" | "deepmind" => Some(IconType::ImageBytes(ICON_ANTIGRAVITY)),
         "busy" | "running" | "loading" | "build" | "spinner" => {
             Some(IconType::ImageBytes(ICON_BUSY))
         }
@@ -148,8 +139,12 @@ pub fn resolve_icon(name: &str) -> Option<ResolvedIcon> {
     // Keeps all user configurations and custom assets in one single place,
     // easily version-controlled within user dotfiles.
     let search_dirs = [
-        crate::config::resolve_config_dir().join("ditoo").join("icons"),
-        crate::config::resolve_data_dir().join("ditoo").join("icons"),
+        crate::config::resolve_config_dir()
+            .join("ditoo")
+            .join("icons"),
+        crate::config::resolve_data_dir()
+            .join("ditoo")
+            .join("icons"),
     ];
 
     let extensions = ["png", "divoom16", "gif", "bmp", "jpg", "jpeg", "webp"];
@@ -171,29 +166,35 @@ pub fn resolve_icon(name: &str) -> Option<ResolvedIcon> {
     }
 
     // 4. Procedural 16x16 Badge Card Fallback
-    if !clean_name.is_empty() && clean_name.len() <= 8
-        && let Ok(temp_path) = generate_procedural_icon(&clean_name) {
-            return Some(ResolvedIcon::Procedural(temp_path));
-        }
+    if !clean_name.is_empty()
+        && clean_name.len() <= 8
+        && let Ok(temp_path) = generate_procedural_icon(&clean_name)
+    {
+        return Some(ResolvedIcon::Procedural(temp_path));
+    }
 
     None
 }
 
 /// Generate a procedural 16x16 badge card when no matching icon file exists
-pub fn generate_procedural_icon(label: &str) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+pub fn generate_procedural_icon(
+    label: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let mut canvas = Canvas::new();
     let text = label.to_uppercase();
 
     // Deterministic palette based on label name
-    let hash = label.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
+    let hash = label
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_add(b as u32));
     let bg_palette: &[[u8; 3]] = &[
-        [15, 23, 42],   // Navy Slate
-        [30, 27, 75],   // Deep Indigo
-        [2, 44, 34],    // Deep Emerald
-        [69, 10, 10],   // Deep Crimson
-        [67, 20, 7],    // Deep Amber
-        [59, 7, 100],   // Deep Purple
-        [8, 47, 73],    // Deep Teal
+        [15, 23, 42], // Navy Slate
+        [30, 27, 75], // Deep Indigo
+        [2, 44, 34],  // Deep Emerald
+        [69, 10, 10], // Deep Crimson
+        [67, 20, 7],  // Deep Amber
+        [59, 7, 100], // Deep Purple
+        [8, 47, 73],  // Deep Teal
     ];
     let bg = bg_palette[(hash as usize) % bg_palette.len()];
     canvas.fill(bg);

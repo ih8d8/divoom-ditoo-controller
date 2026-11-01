@@ -73,7 +73,26 @@ fn test_sysmon_canvas_generation() {
     assert_ne!(ram_bar, [0, 0, 0], "RAM bar should be drawn at (2, 13)");
 
     // Convert to temp PNG
-    let tmp = canvas.to_temp_png().expect("Canvas should convert to temp PNG");
+    let tmp = canvas
+        .to_temp_png()
+        .expect("Canvas should convert to temp PNG");
     assert!(tmp.exists(), "Temp PNG file should exist");
     let _ = std::fs::remove_file(tmp);
+}
+
+#[test]
+fn test_parse_color_amber_and_hex() {
+    use divoom_ditoo_controller::canvas::parse_color;
+
+    let amber = parse_color("amber").expect("Should parse amber");
+    assert_eq!(amber, [255, 191, 0]);
+
+    let amber_upper = parse_color("AMBER ").expect("Should parse uppercase amber");
+    assert_eq!(amber_upper, [255, 191, 0]);
+
+    let hex_without_hash = parse_color("00FF00").expect("Should parse hex without hash");
+    assert_eq!(hex_without_hash, [0, 255, 0]);
+
+    let css_cyan = parse_color("cyan").expect("Should parse standard css cyan");
+    assert_eq!(css_cyan, [0, 255, 255]);
 }

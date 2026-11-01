@@ -19,7 +19,9 @@ pub fn integrate_claude() -> Result<String, Box<dyn Error>> {
         settings = serde_json::json!({});
     }
 
-    let obj = settings.as_object_mut().ok_or("Failed to parse settings as JSON object")?;
+    let obj = settings
+        .as_object_mut()
+        .ok_or("Failed to parse settings as JSON object")?;
     let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
 
     // Add/update Notification hook (idle_prompt or permission_prompt)
@@ -53,7 +55,10 @@ pub fn integrate_claude() -> Result<String, Box<dyn Error>> {
 
     fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
 
-    Ok(format!("Successfully configured Claude Code hooks in {}", settings_path.display()))
+    Ok(format!(
+        "Successfully configured Claude Code hooks in {}",
+        settings_path.display()
+    ))
 }
 
 pub fn integrate_codex() -> Result<String, Box<dyn Error>> {
@@ -74,12 +79,18 @@ pub fn integrate_codex() -> Result<String, Box<dyn Error>> {
         fs::write(&config_path, content)?;
     }
 
-    Ok(format!("Successfully configured Codex CLI notification in {}", config_path.display()))
+    Ok(format!(
+        "Successfully configured Codex CLI notification in {}",
+        config_path.display()
+    ))
 }
 
 /// Simple desktop notification forwarder listening on DBus
 pub async fn run_desktop_monitor(filter_apps: Vec<String>) -> Result<(), Box<dyn Error>> {
-    log::info!("Starting Desktop Notification Monitor (filtering: {:?})...", filter_apps);
+    log::info!(
+        "Starting Desktop Notification Monitor (filtering: {:?})...",
+        filter_apps
+    );
 
     // Run dbus-monitor to listen to notification calls
     let mut child = tokio::process::Command::new("dbus-monitor")
@@ -90,7 +101,10 @@ pub async fn run_desktop_monitor(filter_apps: Vec<String>) -> Result<(), Box<dyn
         .stdout(std::process::Stdio::piped())
         .spawn()?;
 
-    let stdout = child.stdout.take().ok_or("Failed to capture dbus-monitor stdout")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Failed to capture dbus-monitor stdout")?;
     let mut reader = tokio::io::BufReader::new(stdout).lines();
 
     let mut current_app = String::new();
@@ -121,7 +135,11 @@ pub async fn run_desktop_monitor(filter_apps: Vec<String>) -> Result<(), Box<dyn
                 });
 
                 if matches_filter {
-                    log::info!("Desktop notification forwarded: [{}] {}", current_app, current_summary);
+                    log::info!(
+                        "Desktop notification forwarded: [{}] {}",
+                        current_app,
+                        current_summary
+                    );
                     let icon = if app_lower.contains("claude") {
                         "claude"
                     } else if app_lower.contains("codex") {
