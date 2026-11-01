@@ -1,6 +1,6 @@
 [package]
 name = "divoom-ditoo-controller"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Linux integration & programmable notification display for Divoom Ditoo Pro"
 authors = ["Divoom Ditoo Controller Contributors <contributors@noreply.github.com>"]
