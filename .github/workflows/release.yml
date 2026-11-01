@@ -57,7 +57,7 @@ jobs:
           sha256sum divoom-ditoo-controller-linux-x86_64 > divoom-ditoo-controller-linux-x86_64.sha256
 
       - name: Upload Release to GitHub
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ditoo-linux-x86_64.tar.gz
