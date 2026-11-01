@@ -207,12 +207,6 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "bitstream-io"
-version = "2.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6099cdc01846bc367c4e7dd630dc5966dccf36b652fae7a74e17b640411a91b2"
-
-[[package]]
-name = "bitstream-io"
 version = "4.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7eff00be299a18769011411c9def0d827e8f2d7bf0c3dbf53633147a8867fd1f"
@@ -676,7 +670,7 @@ dependencies = [
 name = "divoom-ditoo-pro-controller"
 version = "0.1.0"
 dependencies = [
- "bitstream-io 2.6.0",
+ "bitstream-io",
  "bluer",
  "byteorder",
  "chrono",
@@ -1769,7 +1763,7 @@ dependencies = [
  "arrayvec",
  "av-scenechange",
  "av1-grain",
- "bitstream-io 4.10.0",
+ "bitstream-io",
  "built",
  "cfg-if",
  "interpolate_name",

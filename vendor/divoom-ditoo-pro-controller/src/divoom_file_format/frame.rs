@@ -66,7 +66,7 @@ impl Frame {
 
     for y in 0..height {
       for x in 0..width {
-        let palette_index = pixel_data_reader.read::<u8>(bits_per_pixel.into())?;
+        let palette_index: u8 = pixel_data_reader.read_var(bits_per_pixel.into())?;
         let palette_entry = palette[palette_index as usize];
 
         image.put_pixel(x, y, palette_entry);
@@ -119,7 +119,7 @@ impl Frame {
           .iter()
           .position(|&color| color == pixel)
           .ok_or("Pixel not found in palette")? as u8;
-        pixel_data_writer.write::<u8>(bits_per_pixel.into(), palette_index)?;
+        pixel_data_writer.write_var(bits_per_pixel.into(), palette_index)?;
       }
     }
 
