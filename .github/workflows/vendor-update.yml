@@ -1,0 +1,144 @@
+name: Upstream Vendor Sync
+
+on:
+  schedule:
+    # Mondays 05:27 UTC. Off the hour on purpose to avoid GitHub runner congestion.
+    - cron: '27 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: vendor-update
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Check & Sync Upstream Vendor
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check upstream commit
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current=""
+          if [ -f vendor/divoom-ditoo-pro-controller/.upstream-commit ]; then
+            current="$(cat vendor/divoom-ditoo-pro-controller/.upstream-commit | tr -d '[:space:]')"
+          fi
+          
+          # Upstream repository default branch is 'rust'
+          latest=$(gh api repos/futpib/divoom-ditoo-pro-controller/commits/rust --jq .sha)
+          if [ -z "$latest" ]; then
+            echo "Failed to retrieve upstream commit SHA" >&2
+            exit 1
+          fi
+
+          # Ensure the SHA matches standard hex 40-char format
+          printf '%s' "$latest" | grep -Eq '^[0-9a-f]{40}$' || {
+            echo "Unexpected upstream commit format: $latest" >&2
+            exit 1
+          }
+
+          short_latest="${latest:0:8}"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "short_latest=$short_latest" >> "$GITHUB_OUTPUT"
+
+          if [ "$current" = "$latest" ]; then
+            echo "up-to-date=true" >> "$GITHUB_OUTPUT"
+            echo "Already up to date with upstream futpib/divoom-ditoo-pro-controller ($current)."
+          else
+            echo "up-to-date=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream has new commits: $current -> $latest"
+          fi
+
+      - name: Sync upstream vendor tree
+        if: steps.check.outputs.up-to-date == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.check.outputs.latest }}
+          SHORT_LATEST: ${{ steps.check.outputs.short_latest }}
+        run: |
+          set -euo pipefail
+          branch="vendor-sync/${SHORT_LATEST}"
+
+          # Avoid nagging: if a PR for this branch already exists (open, closed, or merged), exit
+          existing=$(gh pr list --head "$branch" --state all --json number --jq 'length')
+          if [ "$existing" != "0" ]; then
+            echo "A PR for $branch already exists (open, closed or merged); leaving it alone."
+            exit 0
+          fi
+
+          # Download and unpack upstream commit tree
+          tmp_dir=$(mktemp -d)
+          curl -fsSL "https://github.com/futpib/divoom-ditoo-pro-controller/archive/${LATEST}.tar.gz" \
+            | tar -xz -C "$tmp_dir" --strip-components=1
+
+          # Preserve dual-attribution LICENSE
+          cp vendor/divoom-ditoo-pro-controller/LICENSE "$tmp_dir/LICENSE" 2>/dev/null || true
+
+          # Synchronize vendored tree
+          rsync -av --delete --exclude='.git*' "$tmp_dir/" vendor/divoom-ditoo-pro-controller/
+          rm -rf "$tmp_dir"
+
+          # Record upstream commit
+          echo "${LATEST}" > vendor/divoom-ditoo-pro-controller/.upstream-commit
+
+      - name: Install system dependencies
+        if: steps.check.outputs.up-to-date == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libfontconfig1-dev
+
+      - name: Set up Rust toolchain
+        if: steps.check.outputs.up-to-date == 'false'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Verify build and tests with synced vendor
+        if: steps.check.outputs.up-to-date == 'false'
+        run: |
+          cargo check --verbose
+          cargo test --verbose
+
+      - name: Open Pull Request
+        if: steps.check.outputs.up-to-date == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.check.outputs.latest }}
+          CURRENT: ${{ steps.check.outputs.current }}
+          SHORT_LATEST: ${{ steps.check.outputs.short_latest }}
+        run: |
+          set -euo pipefail
+          branch="vendor-sync/${SHORT_LATEST}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add vendor/divoom-ditoo-pro-controller
+          git commit -m "chore(vendor): sync upstream futpib/divoom-ditoo-pro-controller to ${SHORT_LATEST}"
+          git push --force-with-lease origin "$branch"
+
+          base=$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)
+          gh pr create --base "$base" --head "$branch" \
+            --title "chore(vendor): sync upstream futpib/divoom-ditoo-pro-controller to ${SHORT_LATEST}" \
+            --body "$(printf '%s\n' \
+              "Automated sync from upstream repository [futpib/divoom-ditoo-pro-controller](https://github.com/futpib/divoom-ditoo-pro-controller)." \
+              "" \
+              "- **Upstream commit**: [\`${SHORT_LATEST}\`](https://github.com/futpib/divoom-ditoo-pro-controller/commit/${LATEST})" \
+              "- **Previous commit**: \`${CURRENT:-none}\`" \
+              "- **Local verification**: \`cargo check\` and \`cargo test\` passed with the updated vendor tree." \
+              "" \
+              "> Note: Dual attribution to futpib and andreas-mausch in \`vendor/divoom-ditoo-pro-controller/LICENSE\` is preserved." \
+              "> Please review diff before merging.")"

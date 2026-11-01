@@ -1,0 +1,38 @@
+# Grouped on purpose, matching yt-dlp-manager conventions.
+# One PR per ecosystem per week is reviewable; dozens of individual PRs are not.
+#
+# Majors are deliberately left OUT of the groups so they arrive as their own
+# PRs: major breaking jumps need a human and full local verification, and must
+# not ride along inside a routine weekly update.
+
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: "cargo"
+    directory: "/vendor/divoom-ditoo-pro-controller"
+    schedule:
+      interval: "weekly"
+    groups:
+      vendor-dependencies:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 10
