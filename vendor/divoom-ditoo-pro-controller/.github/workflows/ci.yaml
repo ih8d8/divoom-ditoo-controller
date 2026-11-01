@@ -1,0 +1,62 @@
+name: CI
+on: [ push, pull_request ]
+jobs:
+  build_and_test:
+    name: Rust Cargo Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libdbus-1-dev pkg-config
+          version: 1.0
+      - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+      - run: cargo clippy --all-targets --all-features -- --deny warnings
+      - run: cargo check
+      - run: cargo check --no-default-features
+      - run: cargo build --verbose --release --all-features
+      - run: cargo test --verbose --all
+
+  lua_style:
+    name: Lua lint and formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: JohnnyMorganz/stylua-action@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: v2.5.2
+          args: false
+      - run: sudo apt-get update && sudo apt-get install -y lua5.4 liblua5.4-dev luarocks
+      - run: sudo luarocks --lua-version=5.4 install luacheck 1.2.0-1
+      - run: scripts/check-lua.sh
+      - run: python3 -m unittest discover -s scripts -p 'test_lua_tools.py'
+
+  firmware:
+    name: Reproduce firmware and review patches
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned cross-toolchain container
+        run: docker build -t divoom-firmware-ci ci/firmware
+      - name: Check patch guards and manifest tooling
+        run: >-
+          docker run --rm --network none --user "$(id -u):$(id -g)"
+          -v "$PWD:/src:ro" divoom-firmware-ci
+          python3 -m unittest discover -s scripts -p 'test_f*.py'
+      - name: Rebuild twice and compare images and reports
+        run: |
+          mkdir -p target/firmware-review
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+            -v "$PWD:/src:ro" -v "$PWD/target/firmware-review:/reports" \
+            divoom-firmware-ci python3 scripts/check-firmware-repro.py --output /reports
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: firmware-patch-review
+          path: target/firmware-review/
+          if-no-files-found: warn

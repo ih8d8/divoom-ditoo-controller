@@ -1,0 +1,773 @@
+use std::error::Error;
+use std::fs::File;
+use std::io::BufReader;
+#[cfg(feature = "text")]
+use std::path::Path;
+use std::time::Duration;
+#[cfg(feature = "video")]
+use std::thread;
+
+use bluer::Address;
+use chrono::NaiveDateTime;
+use futures::StreamExt;
+#[cfg(feature = "video")]
+use image::{DynamicImage, Rgb, RgbImage};
+#[cfg(feature = "video")]
+use indexmap::IndexSet;
+use log::{debug, info};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+
+use crate::divoom_file_format::animation::Animation as DivoomAnimation;
+#[cfg(feature = "video")]
+use crate::divoom_file_format::frame::Frame;
+#[cfg(feature = "video")]
+use crate::divoom_file_format::frame_header::FrameHeader;
+
+pub mod divoom_file_format;
+pub mod protocol;
+pub mod bluetooth_trace;
+mod transport;
+pub mod control;
+pub mod firmware;
+pub mod usb_firmware;
+pub mod firmware_decode;
+pub mod lua;
+pub mod lua_tools;
+pub mod lua_bundle;
+pub use transport::{Transport, selected_transport, with_transport, with_usb_port};
+mod usb_control;
+use transport::DeviceConnection;
+
+use crate::protocol::alarm::Alarm;
+use crate::protocol::animation::{Animation, ControlWord};
+use crate::protocol::command::Command;
+use crate::protocol::datetime::DateTime;
+use crate::protocol::packet::{Packet, Response};
+
+
+pub async fn scan_devices() -> Result<(), Box<dyn Error>> {
+  let session = bluer::Session::new().await?;
+  let adapter = session.default_adapter().await?;
+  adapter.set_powered(true).await?;
+
+  let duration = Duration::from_secs(20);
+  info!("Scanning bluetooth devices for {:?}", duration);
+
+  let discover = adapter.discover_devices().await?;
+  tokio::pin!(discover);
+
+  let timeout = tokio::time::sleep(duration);
+  tokio::pin!(timeout);
+
+  loop {
+    tokio::select! {
+      Some(event) = discover.next() => {
+        if let bluer::AdapterEvent::DeviceAdded(addr) = event {
+          let device = adapter.device(addr)?;
+          let name = device.name().await?.unwrap_or_default();
+          info!("Found device: {} ({})", name, addr);
+        }
+      }
+      _ = &mut timeout => {
+        info!("Scan complete");
+        break;
+      }
+    }
+  }
+
+  Ok(())
+}
+
+pub async fn find_paired_ditoo_pro_devices() -> Result<Vec<Address>, Box<dyn Error>> {
+  let session = bluer::Session::new().await?;
+  let adapter = session.default_adapter().await?;
+
+  let addresses = adapter.device_addresses().await?;
+
+  let mut result = Vec::new();
+  for addr in addresses {
+    let device = adapter.device(addr)?;
+    let is_paired = device.is_paired().await?;
+    if !is_paired {
+      continue;
+    }
+
+    let name = device.name().await?.unwrap_or_default();
+    let lower = name.to_lowercase();
+    if !lower.contains("ditoo") && !lower.contains("divoom") {
+      continue;
+    }
+
+    result.push(addr);
+  }
+
+  Ok(result)
+}
+
+pub async fn list_paired_devices() -> Result<(), Box<dyn Error>> {
+  let session = bluer::Session::new().await?;
+  let adapter = session.default_adapter().await?;
+
+  for addr in find_paired_ditoo_pro_devices().await? {
+    let device = adapter.device(addr)?;
+    let name = device.name().await?.unwrap_or_default();
+    let is_connected = device.is_connected().await?;
+    info!(
+      "{} ({}) - connected: {}",
+      name, addr, is_connected
+    );
+  }
+
+  Ok(())
+}
+
+async fn read_response(reader: &mut bluer::rfcomm::stream::OwnedReadHalf) -> Result<Response, Box<dyn Error + Send + Sync>> {
+  let start = reader.read_u8().await?;
+  if start != 0x01 {
+    return Err(format!("Expected start byte 0x01, got 0x{:02x}", start).into());
+  }
+
+  let mut len_bytes = [0u8; 2];
+  reader.read_exact(&mut len_bytes).await?;
+  let length = u16::from_le_bytes(len_bytes) as usize;
+
+  // Read: payload (length - 2 for checksum) + checksum (2) + end byte (1) = length + 1
+  let mut remaining = vec![0u8; length + 1];
+  reader.read_exact(&mut remaining).await?;
+
+  let mut frame = vec![0x01];
+  frame.extend_from_slice(&len_bytes);
+  frame.extend_from_slice(&remaining);
+
+  debug!("Received response: {}", hex::encode(&frame));
+
+  Response::deserialize(&frame)
+}
+
+const MAX_CONNECT_ATTEMPTS: u32 = 3;
+const INTER_PACKET_DELAY: Duration = Duration::from_millis(40);
+
+pub(crate) struct ClassicConnection {
+  writer: bluer::rfcomm::stream::OwnedWriteHalf,
+  _reader_handle: tokio::task::JoinHandle<()>,
+  response_rx: mpsc::UnboundedReceiver<Response>,
+  _session: bluer::Session,
+  _profile_handle: bluer::rfcomm::ProfileHandle,
+  device: transport::DeviceLease,
+}
+
+impl ClassicConnection {
+  async fn connect(mac_address: Address) -> Result<Self, Box<dyn Error>> {
+    info!("Connecting to device with MAC address {}", mac_address);
+
+    let mut last_error = String::new();
+    for attempt in 1..=MAX_CONNECT_ATTEMPTS {
+      if attempt > 1 {
+        info!("Retrying connection (attempt {}/{})..", attempt, MAX_CONNECT_ATTEMPTS);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+      }
+
+      match tokio::time::timeout(Duration::from_secs(8), Self::try_connect(mac_address)).await {
+        Ok(Ok(conn)) => return Ok(conn),
+        Ok(Err(error)) => last_error = error.to_string(),
+        Err(error) => last_error = format!("RFCOMM connection timed out: {error}"),
+      }
+      debug!("Connection attempt {} failed: {}", attempt, last_error);
+    }
+
+    Err(format!("Failed to connect via RFCOMM: {last_error}").into())
+  }
+
+  async fn try_connect(mac_address: Address) -> Result<Self, Box<dyn Error>> {
+    let session = bluer::Session::new().await?;
+    let adapter = session.default_adapter().await?;
+    adapter.set_powered(true).await?;
+
+    let spp_uuid = uuid::Uuid::from_u128(0x00001101_0000_1000_8000_00805f9b34fb);
+
+    let profile = bluer::rfcomm::Profile {
+      uuid: spp_uuid,
+      name: Some("divoom-controller".to_string()),
+      role: Some(bluer::rfcomm::Role::Client),
+      require_authentication: Some(false),
+      require_authorization: Some(false),
+      auto_connect: Some(false),
+      ..Default::default()
+    };
+
+    let mut profile_handle = session.register_profile(profile).await?;
+    let device = adapter.device(mac_address)?;
+    let lease = transport::DeviceLease::new_classic(device.clone()).await?;
+
+    // ConnectProfile selects BR/EDR and resolves SDP even with only a cached
+    // BLE device. Generic Connect may choose BLE or connect audio profiles.
+    let connect = async {
+      match device.connect_profile(&spp_uuid).await {
+        Err(error) if error.kind == bluer::ErrorKind::NotFound => {
+          // A non-discoverable peer may have expired from BlueZ's device cache.
+          // Bootstrap that explicit Classic address, then request our profile.
+          adapter.connect_device(mac_address, bluer::AddressType::BrEdr).await?;
+          device.connect_profile(&spp_uuid).await
+        }
+        result => result,
+      }
+    };
+    tokio::pin!(connect);
+    let mut completed = false;
+
+    // BlueZ waits for our NewConnection reply before completing ConnectProfile.
+    // Accept the stream while that call is pending, not after it returns.
+    let stream = loop {
+      tokio::select! {
+        result = &mut connect, if !completed => {
+          completed = true;
+          if let Err(error) = result {
+            debug!("connect_profile: {error} (waiting for profile handle)");
+          }
+        }
+        request = profile_handle.next() => {
+          let req = request.ok_or("ProfileHandle stream closed")?;
+          if req.device() == mac_address {
+            break req.accept()?;
+          }
+        }
+      }
+    };
+    if !completed {
+      connect.await?;
+    }
+
+    info!("Connected via SDP profile");
+    let (reader, writer) = stream.into_split();
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // Spawn background reader task
+    let reader_handle = tokio::spawn(async move {
+      let mut reader = reader;
+      loop {
+        match read_response(&mut reader).await {
+          Ok(response) => {
+            debug!("Background reader got response: {:?}", response);
+            if tx.send(response).is_err() {
+              debug!("Response channel closed, stopping reader");
+              break;
+            }
+          }
+          Err(e) => {
+            debug!("Background reader error: {}", e);
+            break;
+          }
+        }
+      }
+    });
+
+    Ok(ClassicConnection {
+      writer,
+      _reader_handle: reader_handle,
+      response_rx: rx,
+      _session: session,
+      _profile_handle: profile_handle,
+      device: lease,
+    })
+  }
+
+  async fn send_and_receive(&mut self, packet: &Packet) -> Result<Response, Box<dyn Error>> {
+    self.exchange(packet, packet.command.value(), &[]).await
+  }
+
+  async fn exchange(&mut self, packet: &Packet, expected_command: u8, prefix: &[u8]) -> Result<Response, Box<dyn Error>> {
+    while self.response_rx.try_recv().is_ok() {}
+    let serialized = packet.serialize()?;
+    debug!("send_and_receive 0x{:02x}: {}", expected_command, hex::encode(&serialized));
+    self.writer.write_all(&serialized).await?;
+    tokio::time::sleep(INTER_PACKET_DELAY).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+      let response = tokio::time::timeout_at(deadline, self.response_rx.recv()).await
+        .map_err(|_| format!("Timed out waiting for response to command 0x{:02x}", expected_command))?
+        .ok_or("Response channel closed")?;
+      if response.original_command != expected_command || !response.data.starts_with(prefix) {
+        debug!("Skipping unsolicited response for command 0x{:02x}", response.original_command);
+        continue;
+      }
+      if !response.ack {
+        return Err(format!("Device NAK'd command 0x{:02x}", expected_command).into());
+      }
+      return Ok(response);
+    }
+  }
+
+  async fn fire_and_forget(&mut self, packet: &Packet) -> Result<(), Box<dyn Error>> {
+    let serialized = packet.serialize()?;
+    debug!("fire_and_forget 0x{:02x}: {}", packet.command.value(), hex::encode(&serialized));
+    self.writer.write_all(&serialized).await?;
+    tokio::time::sleep(INTER_PACKET_DELAY).await;
+    Ok(())
+  }
+
+  async fn disconnect(mut self) -> Result<(), Box<dyn Error>> {
+    info!("Disconnecting from device");
+    self._reader_handle.abort();
+    self.writer.shutdown().await?;
+    self.device.release().await?;
+    Ok(())
+  }
+}
+
+fn create_network_packets_from(animation: &[u8]) -> Result<Vec<Packet>, Box<dyn Error>> {
+  let mut packets = Vec::<Packet>::new();
+  packets.push(Packet {
+    command: Command::Animation,
+    payload: Animation {
+      control_word: ControlWord::StartSeeding,
+      file_size: animation.len() as u32,
+      offset_id: 0,
+      image_part: Vec::new()
+    }
+    .serialize()?
+  });
+
+  let mut animation_packets = animation
+    .chunks(256)
+    .enumerate()
+    .map(|(index, chunk)| {
+      Ok(Packet {
+        command: Command::Animation,
+        payload: Animation {
+          control_word: ControlWord::SendingData,
+          file_size: animation.len() as u32,
+          offset_id: index as u16,
+          image_part: chunk.to_vec()
+        }
+        .serialize()?
+      })
+    })
+    .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+  packets.append(&mut animation_packets);
+
+  Ok(packets)
+}
+
+pub async fn send_alarm(mac_address: Address, alarm: &Alarm) -> Result<(), Box<dyn Error>> {
+  let packet = Packet {
+    command: Command::Alarm,
+    payload: alarm.serialize()?
+  };
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  conn.fire_and_forget(&packet).await?;
+  conn.disconnect().await?;
+  Ok(())
+}
+
+pub async fn send_divoom_animation(
+  mac_address: Address,
+  reader: &mut (dyn std::io::Read + Send)
+) -> Result<(), Box<dyn Error>> {
+  let mut animation = Vec::new();
+  reader.read_to_end(&mut animation)?;
+
+  let packets = create_network_packets_from(&animation)?;
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  for (index, packet) in packets.iter().enumerate() {
+    info!("Sending packet {}/{}..", index + 1, packets.len());
+    conn.fire_and_forget(packet).await?;
+  }
+  conn.disconnect().await?;
+  Ok(())
+}
+
+pub async fn send_set_datetime(
+  mac_address: Address,
+  datetime: NaiveDateTime
+) -> Result<(), Box<dyn Error>> {
+  let payload = DateTime { datetime };
+  let packet = Packet {
+    command: Command::SetDateTime,
+    payload: payload.serialize()?
+  };
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  conn.fire_and_forget(&packet).await?;
+  conn.disconnect().await?;
+  Ok(())
+}
+
+pub async fn send_set_brightness(
+  mac_address: Address,
+  brightness: u8
+) -> Result<(), Box<dyn Error>> {
+  let packet = Packet {
+    command: Command::SetBrightness,
+    payload: vec![brightness]
+  };
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  conn.fire_and_forget(&packet).await?;
+  conn.disconnect().await?;
+  Ok(())
+}
+
+pub async fn send_set_volume(
+  mac_address: Address,
+  volume: u8
+) -> Result<(), Box<dyn Error>> {
+  let packet = Packet {
+    command: Command::SetVolume,
+    payload: vec![volume]
+  };
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  conn.fire_and_forget(&packet).await?;
+  conn.disconnect().await?;
+  Ok(())
+}
+
+pub async fn send_set_play_status(
+  mac_address: Address,
+  playing: bool
+) -> Result<(), Box<dyn Error>> {
+  let packet = Packet {
+    command: Command::SetPlayStatus,
+    payload: vec![if playing { 1 } else { 0 }]
+  };
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  conn.fire_and_forget(&packet).await?;
+  conn.disconnect().await?;
+  Ok(())
+}
+
+pub async fn send_get_volume(
+  mac_address: Address,
+) -> Result<u8, Box<dyn Error>> {
+  let packet = Packet {
+    command: Command::GetVolume,
+    payload: vec![]
+  };
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  let response = conn.send_and_receive(&packet).await?;
+  conn.disconnect().await?;
+  let volume = response.data.first()
+    .ok_or("GetVolume response contained no data")?;
+  Ok(*volume)
+}
+
+pub async fn send_set_box_mode(
+  mac_address: Address,
+  payload: Vec<u8>
+) -> Result<(), Box<dyn Error>> {
+  let packet = Packet {
+    command: Command::SetBoxMode,
+    payload
+  };
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  conn.fire_and_forget(&packet).await?;
+  conn.disconnect().await?;
+  Ok(())
+}
+
+pub async fn send_set_screen_power(
+  mac_address: Address,
+  power_on: bool,
+) -> Result<(), Box<dyn Error>> {
+  let packet = protocol::extended_command::build_packet(
+    0x2f,
+    &[power_on as u8],
+  );
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  conn.fire_and_forget(&packet).await?;
+  conn.disconnect().await?;
+  Ok(())
+}
+
+pub async fn send_set_clock_face(
+  mac_address: Address,
+  clock_id: u16
+) -> Result<(), Box<dyn Error>> {
+  let packet = protocol::extended_command::build_packet(
+    protocol::extended_command::SET_USER_DEFINE_TIME,
+    &clock_id.to_le_bytes(),
+  );
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  conn.fire_and_forget(&packet).await?;
+  conn.disconnect().await?;
+  Ok(())
+}
+
+pub async fn send_get_clock_face(
+  mac_address: Address,
+) -> Result<u16, Box<dyn Error>> {
+  let packet = protocol::extended_command::build_packet(
+    protocol::extended_command::GET_USER_DEFINE_TIME,
+    &[],
+  );
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  let response = conn.send_and_receive(&packet).await?;
+  conn.disconnect().await?;
+  if response.data.len() < 3 {
+    return Err("GetClockFace response too short".into());
+  }
+  let clock_id = u16::from_le_bytes([response.data[1], response.data[2]]);
+  Ok(clock_id)
+}
+
+pub async fn send_set_language(
+  mac_address: Address,
+  lang_index: u8
+) -> Result<(), Box<dyn Error>> {
+  let packet = protocol::extended_command::build_packet(
+    protocol::extended_command::SET_LANGUAGE,
+    &[lang_index],
+  );
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  conn.fire_and_forget(&packet).await?;
+  conn.disconnect().await?;
+  Ok(())
+}
+
+pub async fn send_keyboard_backlight(
+  mac_address: Address,
+  mode: u8
+) -> Result<(), Box<dyn Error>> {
+  let packet = Packet {
+    command: Command::LightArrowSwitch,
+    payload: protocol::keyboard_backlight::serialize(mode)
+  };
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  conn.fire_and_forget(&packet).await?;
+  conn.disconnect().await?;
+  Ok(())
+}
+
+#[cfg(feature = "text")]
+pub async fn send_scrolling_text(
+  mac_address: Address,
+  font_path: &Path,
+  text: &str,
+  font_size: f32,
+  fg_color: [u8; 3],
+  bg_color: [u8; 3],
+  halign: protocol::scrolling_text::HAlign,
+  valign: protocol::scrolling_text::VAlign,
+) -> Result<(), Box<dyn Error>> {
+  let scrolling_text = protocol::scrolling_text::build_scrolling_text_frames(font_path, text, font_size, fg_color, bg_color, halign, valign)?;
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+
+  conn.fire_and_forget(&Packet {
+    command: Command::DrawingCtrlMoviePlay,
+    payload: vec![0x00],
+  }).await?;
+
+  conn.fire_and_forget(&Packet {
+    command: Command::DrawingCtrlMoviePlay,
+    payload: vec![0x01],
+  }).await?;
+
+  let speed: u16 = 60;
+  let total = scrolling_text.encoded_frames.len();
+  for (index, encoded_data) in scrolling_text.encoded_frames.iter().enumerate() {
+    let data_len = encoded_data.len() as u16;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&speed.to_le_bytes());
+    payload.extend_from_slice(&data_len.to_le_bytes());
+    payload.extend_from_slice(encoded_data);
+
+    let packet = Packet {
+      command: Command::DrawingEncodeMoviePlay,
+      payload,
+    };
+
+    if index % 100 == 0 {
+      info!("Sending frame {}/{}..", index + 1, total);
+    }
+    conn.fire_and_forget(&packet).await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+  }
+
+  conn.fire_and_forget(&Packet {
+    command: Command::DrawingCtrlMoviePlay,
+    payload: vec![0x00],
+  }).await?;
+
+  conn.disconnect().await?;
+  Ok(())
+}
+
+
+#[cfg(feature = "text")]
+pub async fn send_static_text(
+  mac_address: Address,
+  font_path: &Path,
+  text: &str,
+  font_size: f32,
+  fg_color: [u8; 3],
+  bg_color: [u8; 3],
+  halign: protocol::scrolling_text::HAlign,
+  valign: protocol::scrolling_text::VAlign,
+) -> Result<(), Box<dyn Error>> {
+  let image = protocol::static_text::build_static_text_image(font_path, text, font_size, fg_color, bg_color, halign, valign)?;
+  let animation = DivoomAnimation::from_image(image)?;
+  let mut buf = Vec::new();
+  animation.save_to_divoom_format(&mut buf)?;
+  let packets = create_network_packets_from(&buf)?;
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  for (index, packet) in packets.iter().enumerate() {
+    info!("Sending packet {}/{}..", index + 1, packets.len());
+    conn.fire_and_forget(packet).await?;
+  }
+  conn.disconnect().await?;
+  Ok(())
+}
+
+pub async fn send_image(
+  mac_address: Address,
+  filename: &str
+) -> Result<(), Box<dyn Error>> {
+  let animation = if filename.ends_with(".gif") || filename.ends_with(".GIF") {
+    DivoomAnimation::from_gif(&mut BufReader::new(File::open(filename)?))?
+  } else {
+    DivoomAnimation::from_image(image::open(filename)?)?
+  };
+  let mut buf = Vec::new();
+  animation.save_to_divoom_format(&mut buf)?;
+  let packets = create_network_packets_from(&buf)?;
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+  for (index, packet) in packets.iter().enumerate() {
+    info!("Sending packet {}/{}..", index + 1, packets.len());
+    conn.fire_and_forget(packet).await?;
+  }
+  conn.disconnect().await?;
+  Ok(())
+}
+
+#[cfg(feature = "video")]
+fn encode_rgb_frame(rgb: &[u8; 768]) -> Result<Vec<u8>, Box<dyn Error>> {
+  let mut palette = IndexSet::new();
+  let mut image = RgbImage::new(16, 16);
+  for i in 0..256 {
+    let color = Rgb([rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]]);
+    palette.insert(color);
+    image.put_pixel((i % 16) as u32, (i / 16) as u32, color);
+  }
+  let palette: Vec<Rgb<u8>> = palette.into_iter().collect();
+
+  let frame = Frame {
+    header: FrameHeader {
+      time_in_milliseconds: 60,
+      reuse_palette: false,
+      color_count: palette.len() as u8,
+    },
+    palette: palette.clone(),
+    local_palette: palette.clone(),
+    image: DynamicImage::ImageRgb8(image),
+  };
+
+  let mut encoded = Vec::new();
+  frame.serialize(&palette, &mut encoded)?;
+  Ok(encoded)
+}
+
+#[cfg(feature = "video")]
+pub async fn send_video(
+  mac_address: Address,
+  file_path: &str,
+  mpv_options: &[(String, String)],
+) -> Result<(), Box<dyn Error>> {
+  let (frame_tx, mut frame_rx) = mpsc::channel::<[u8; 768]>(2);
+  let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+  let file_path = file_path.to_string();
+  let mpv_options = mpv_options.to_vec();
+  let mpv_handle = thread::spawn(move || {
+    let player = match protocol::video::VideoPlayer::new(&file_path, mac_address, &mpv_options) {
+      Ok(p) => p,
+      Err(e) => {
+        log::error!("Failed to create video player: {}", e);
+        return;
+      }
+    };
+
+    let mut stop_rx = stop_rx;
+    loop {
+      if let Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) = stop_rx.try_recv() {
+        break;
+      }
+
+      if player.poll_events() {
+        break;
+      }
+
+      if let Some(rgb) = player.render_frame() {
+        if frame_tx.try_send(rgb).is_err() {
+          // Channel full or closed — drop frame to keep real-time pace
+        }
+      }
+
+      thread::sleep(Duration::from_millis(5));
+    }
+  });
+
+  let mut conn = DeviceConnection::connect(mac_address).await?;
+
+  conn.fire_and_forget(&Packet {
+    command: Command::DrawingCtrlMoviePlay,
+    payload: vec![0x00],
+  }).await?;
+
+  conn.fire_and_forget(&Packet {
+    command: Command::DrawingCtrlMoviePlay,
+    payload: vec![0x01],
+  }).await?;
+
+  let speed: u16 = 60;
+  let mut frame_count: u64 = 0;
+  let ctrl_c = tokio::signal::ctrl_c();
+  tokio::pin!(ctrl_c);
+
+  loop {
+    tokio::select! {
+      frame = frame_rx.recv() => {
+        match frame {
+          Some(rgb) => {
+            let encoded = encode_rgb_frame(&rgb)?;
+            let data_len = encoded.len() as u16;
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&speed.to_le_bytes());
+            payload.extend_from_slice(&data_len.to_le_bytes());
+            payload.extend_from_slice(&encoded);
+
+            conn.fire_and_forget(&Packet {
+              command: Command::DrawingEncodeMoviePlay,
+              payload,
+            }).await?;
+
+            frame_count += 1;
+            if frame_count.is_multiple_of(100) {
+              info!("Sent {} video frames", frame_count);
+            }
+          }
+          None => {
+            info!("Video playback ended ({} frames sent)", frame_count);
+            break;
+          }
+        }
+      }
+      _ = &mut ctrl_c => {
+        info!("Interrupted, stopping video playback");
+        break;
+      }
+    }
+  }
+
+  let _ = stop_tx.send(());
+  let _ = mpv_handle.join();
+
+  conn.fire_and_forget(&Packet {
+    command: Command::DrawingCtrlMoviePlay,
+    payload: vec![0x00],
+  }).await?;
+
+  conn.disconnect().await?;
+  Ok(())
+}
+
+impl Drop for ClassicConnection {
+  fn drop(&mut self) { self._reader_handle.abort(); }
+}

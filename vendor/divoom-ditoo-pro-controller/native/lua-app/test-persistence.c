@@ -1,0 +1,98 @@
+static const char *save_app(const char *text,unsigned size,unsigned *changed) {
+    struct source *s=NULL;
+    if(size) { s=source_new(size);assert(s);source_copy(s,0,(void *)text,size,1); }
+    const char *error=persist_save(1,s,size,changed);source_free(s);return error;
+}
+static void test_persistence(void) {
+    unsigned base=0x6000,payload=0x6100;
+    memcpy(config_context+12,&base,4);memcpy(config_context+8,&payload,4);
+    stock_config_context=config_context;
+    unsigned changed,bank=0,foreign=0;
+    config_context[0]=1;assert(!persist_layout());config_context[0]=0;
+    config_context[0]=52;config_context[2]=1;config_context[4]=52;assert(!persist_layout());
+    config_context[2]=2;assert(persist_layout());
+    config_context[0]=102;config_context[4]=102;
+    assert(save_app("return {}",9,&changed) && !changed && !persist_writes);
+    config_context[0]=config_context[2]=config_context[4]=0;
+    assert(!save_app("return {}",9,&changed) && changed);
+    assert(persist_writes==1);
+    unsigned char request[32]={0x37,0x7f,'D','L','U','A',3,9,0,2};
+    runtime_command(0,request,12);assert(app.state==UPLOADING && app.install);
+    request[6]=4;request[7]=0;memcpy(request+9,"return {}",9);
+    runtime_command(0,request,20);assert(app.received==9);
+    request[6]=5;runtime_command(0,request,9);assert(app.state==SAVING);
+    request[6]=11;runtime_command(0,request,9);assert(reply[6]==2 && app.state==SAVING);
+    runtime_boot_service();assert(app.state==RUNNING && persist_writes==1);
+    launch();assert(app.state==ACTIVE);app.cancel=1;service();runtime_native_service();assert(!allocations);
+    memset(&app,0,sizeof app);memset(&saved,0,sizeof saved);
+
+    assert(!save_app("return {}",9,&changed) && !changed && persist_writes==1);
+    persist_torn=1;
+    assert(save_app("return {init=function() end}",28,&changed));
+    struct saved_record *r=persist_latest(1,&bank,&foreign);
+    assert(r && !foreign && r->length==9 && !memcmp(r->data,"return {}",9));stock_free(r);
+    persist_torn=0;
+    assert(!save_app("return {update=function() end}",30,&changed));
+    r=persist_latest(1,&bank,&foreign);assert(r && r->sequence==2 && r->length==30);stock_free(r);
+    assert(!persist_save(2,"TV2|-|2,3,4,5",13,&changed));
+    memset(&saved,0,sizeof saved);memset(&app,0,sizeof app);
+    runtime_boot_service();assert(saved.initialized && saved.settings_size==13 && app.state==IDLE);
+    clock_ms+=2999;runtime_boot_service();assert(app.state==IDLE);
+    ++clock_ms;runtime_boot_service();assert(app.state==RUNNING && app.source_size==30);
+    launch();assert(app.state==ACTIVE);app.cancel=1;service();runtime_native_service();assert(!allocations);
+    memset(&app,0,sizeof app);memset(&saved,0,sizeof saved);
+    runtime_boot_service();runtime_adc_result(1U<<16 | 2);
+    clock_ms+=3000;runtime_boot_service();assert(saved.boot_done && saved.boot_skip && app.state==IDLE);
+    assert(app.suppressed & (1U<<2));runtime_adc_result(2U<<16 | 2);assert(!app.suppressed);
+    char full[SOURCE_LIMIT];memset(full,'x',sizeof full);memcpy(full,"return {} --",12);
+    track_heap=1;free_heap=78000;
+    assert(!save_app(full,sizeof full,&changed) && changed);
+    /* Exercise compaction with both full-size generations, then reject a
+     * lower native budget before any write or source-page consumption. */
+    full[100]^=1;
+    assert(!save_app(full,sizeof full,&changed) && changed);
+    unsigned used=1000;memcpy(config_context+4,&used,4);config_context[0]=3;config_context[2]=1;
+    full[100]^=1;unsigned before_gc=compactions;
+    assert(!save_app(full,sizeof full,&changed) && changed && compactions==before_gc+1);
+    free_heap=74000;full[101]^=1;unsigned refused=persist_writes;
+    assert(save_app(full,sizeof full,&changed) && !changed && persist_writes==refused && !allocations);
+    full[101]^=1;free_heap=78000;
+    unsigned writes=persist_writes;
+    assert(!save_app(full,sizeof full,&changed) && !changed && persist_writes==writes);
+    memset(&saved,0,sizeof saved);memset(&app,0,sizeof app);
+    runtime_boot_service();clock_ms+=3000;runtime_boot_service();
+    assert(app.state==RUNNING && app.source_size==sizeof full);
+    assert(source_matches(app.source,full,sizeof full));
+    launch();assert(app.state==ACTIVE);app.cancel=1;service();runtime_native_service();assert(!allocations);
+    memset(&app,0,sizeof app);
+    track_heap=0;free_heap=100000;
+    assert(!save_app("while true do end",17,&changed));
+    memset(&saved,0,sizeof saved);runtime_boot_service();clock_ms+=3000;runtime_boot_service();launch();
+    assert(app.state==ERROR);clock_ms+=10000;runtime_boot_service();assert(app.state==ERROR && !allocations);
+    assert(!save_app(NULL,0,&changed));
+    memset(&app,0,sizeof app);memset(&saved,0,sizeof saved);
+    runtime_boot_service();clock_ms+=3000;runtime_boot_service();assert(app.state==IDLE);
+    persisted[6][0]=0;foreign=0;r=persist_latest(1,&bank,&foreign);stock_free(r);assert(foreign);
+    assert(save_app("return {}",9,&changed) && !changed);
+    assert(persist_save(2,NULL,129,&changed));
+    config_context[0]=config_context[2]=config_context[4]=config_context[5]=0;
+    stock_config_context=NULL;
+    assert(save_app("return {}",9,&changed));
+    memset(&app,0,sizeof app);memset(&saved,0,sizeof saved);
+    runtime_boot_service();clock_ms+=10000;runtime_boot_service();assert(saved.boot_done);
+    app.state=SAVING;app.source=source_new(1);runtime_boot_service();
+    assert(app.state==ERROR && !app.source && !allocations);
+    app.state=SAVING;app.source=source_new(1);app.cancel=1;runtime_boot_service();
+    assert(app.state==DONE && !app.source && !allocations);
+    memset(&app,0,sizeof app);memset(&saved,0,sizeof saved);
+    memset(persisted_size,0,sizeof persisted_size);stock_config_context=config_context;
+    struct saved_record *legacy=(struct saved_record *)persisted[0];
+    memset(legacy,0,8216);legacy->magic=0x41554c44;legacy->kind=1;legacy->length=9;
+    memcpy(legacy->data,"return {}",9);legacy->crc=persist_crc(legacy);persisted_size[0]=8216;
+    persisted_size[1]=8216;memset(persisted[1],0,8216);
+    persist_retire_legacy();assert(persisted_size[0]==24 && persisted_size[1]==8216);
+    foreign=0;r=persist_latest(1,&bank,&foreign);assert(!r && !foreign);
+    stock_config_context=NULL;
+    memset(persisted_size,0,sizeof persisted_size);persist_writes=0;peripheral.writes=0;
+    puts("Saved app and settings: A/B fallback, corruption, no-op writes, full-size reboot, boot escape, crash without restart and uninstall passed");
+}

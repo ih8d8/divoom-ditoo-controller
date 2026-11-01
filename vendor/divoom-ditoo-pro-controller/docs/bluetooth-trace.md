@@ -1,0 +1,161 @@
+# Ditoo-side Bluetooth diagnostics
+
+Bluetooth tracing runs independently of the Lua app. Firmware 306036 allocates
+its history only while requested: start the watcher before reproducing a problem.
+Earlier firmware (306024–306035) records continuously. Read an existing capture or
+watch while the Ditoo connects to a TV:
+
+```sh
+divoom-ditoo-pro-controller --transport usb bluetooth trace --seconds 0
+divoom-ditoo-pro-controller --transport usb bluetooth trace --seconds 120 \
+  > firmware/runs/tv-trace.jsonl
+```
+
+The command checks the firmware version before sending the diagnostic. It does
+not stop, replace, pause or message the Lua app, change discoverability, initiate
+connections or remove bonds. BLE also supports the diagnostic; USB leaves the
+radio free for the TV.
+
+Each event has a sequence number and device uptime in milliseconds.
+
+| # | Layer | Recorded information |
+| --- | --- | --- |
+| 1 | `hci` | Connection requests/completions, authentication and encryption, remote pairing capabilities, confirmation requests, pairing completion, failed command status and disconnect reasons. |
+| 2 | `stack` | Initialization, memory errors, access changes, timeouts, bond changes and pairing failures. Only fields initialized by each callback are recorded; native errors remain raw. |
+| 3 | `hid_l2cap` | Incoming, opened and closed HID channels: PSM, CID, peer and native status. These status values are not HCI error codes. |
+| 4 | `hid_link` | Native HID connection-manager callbacks and raw status. |
+| 5 | `hid_error` | Extension error codes matching `keyboard.status(true).error`. |
+| 6 | `disconnect_request` (306027+) | Stock application, forced-link and link-disconnect callers; link records include the peer and requested reason. |
+| 7 | `hogp_subscription` (306031+) | Accepted CCCD writes and restoration on encrypted bonded reconnect, with connection handle and subscription bits. No encryption keys. |
+| 8 | `hogp_storage` (306034+) | Bond slot, requested subscription mask, read-back mask and verification result after a journal write. No encryption keys. |
+| 9 | `ble_radio` (306043+) | Current advertising active/requested/allowed flags, pending configuration bits, identity transition, and HID state/handle. No pointers or pairing keys. |
+
+On 306043, the CLI requests a radio snapshot immediately and every five seconds.
+This distinguishes a Lua app waiting for a device from the native stack's
+advertising state; it does not establish reception over the air. The low three
+`advertising_pending` bits mean payload, scan response
+and parameters respectively; other bits are retained as native values. A false
+`advertising_allowed` flag can be normal while a connection occupies the sole
+peripheral slot. `identity_pending` is 0 when settled, 1 while disabling
+advertising, or 2 while installing the random identity. `hid_handle=65535` means
+the HID extension has not adopted a connection; it does not prove the native
+stack has no other BLE connection. Snapshots observe state without changing it.
+
+Disconnect callers are native return addresses; subtract four to locate the
+calling `jal` in stock disassembly. The three entry points are `BtDisconnectCtrl`
+at `0x7e734`, `ME_ForceDisconnectLinkWithReason` at `0x128308`, and
+`MeDisconnectLink` at `0x126b8a`. Allowed-request records precede native processing
+and do not establish that the link actually closed. Correlate them with HCI completion.
+Application requests carry only the caller; the other two include the peer,
+requested reason and force flag or native link state. No link key is recorded.
+
+Application event 4, `application_suppressed`, records a request skipped by the
+306027 keyboard-only policy. Only callers `0x170a8` and `0x1759c` are suppressed;
+event 1, `application`, still means the original routine ran. See the
+[persistent keyboard connection fix](lua-keyboard.md#idle-links-and-reconnecting).
+
+HCI status and disconnect reasons include numeric values and names. Correlate
+handle-only events with the preceding connection-complete peer. IO capability
+responses describe the remote device. Pairing success does not imply open HID
+channels or keys accepted by the remote application. No HID events alone cannot
+establish whether pairing or SDP failed.
+
+From 306036, the latest 32 events use a 768-byte native heap ring allocated by
+the first read. Each read renews a 15-second lease. The updated CLI releases the
+ring on completion or Ctrl-C; the lease handles a killed/disconnected reader.
+No events are retained while tracing is off, so a fresh `--seconds 0` normally
+returns an empty history. Older firmware keeps the ring in static RAM.
+Recording itself allocates no heap, writes no flash and uses none of the Lua arena. Short interrupt-protected sections serialize records
+and snapshot copies; USB replies happen after interrupts are restored. Reads are
+non-destructive, with independent reader cursors and at most six records per
+160-byte reply. The CLI reports overwritten events, polls every 200 ms by default,
+and cleans up on completion or Ctrl-C. USB permits one host command connection
+at a time: stop the watcher before running another USB CLI command. The app
+and its physical buttons continue running while watching. `--interval-ms` accepts 50 through 5000.
+
+Records disappear when the lease ends or on reboot. A backwards cursor produces a reset notice; a
+reboot cannot always be identified if new events have already overtaken the old
+cursor. Reopen the command after a USB disconnection.
+
+This selected event trace omits SDP/ACL payloads, outgoing HCI commands, audio
+and keyboard reports. Link-key notifications retain only address and key type.
+Keys, PINs, passkeys and numeric confirmation values are never copied. Addresses
+remain in output. Keep raw captures in ignored `firmware/runs/`; commit concise
+verification reports when useful.
+
+## Laptop capture
+
+For a connection involving the laptop itself:
+
+```sh
+sudo btmon -i hci0 -w /tmp/ditoo-laptop.btsnoop
+```
+
+[BlueZ btmon](https://github.com/bluez/bluez/wiki/btmon) observes the laptop
+controller's HCI interface. An ordinary adapter does not passively capture a
+separate TV–Ditoo connection. That needs appropriate external capture hardware
+or endpoint logs. Ditoo's new trace provides endpoint metadata without TV ADB.
+Laptop captures can contain link keys and unrelated devices' traffic.
+
+## Build and ABI
+
+```sh
+python3 scripts/build-lua-app-runtime.py
+python3 scripts/firmware-manifest.py firmware/306027-lua.MVA --check
+python3 scripts/test-lua-app-runtime.py
+cargo test --locked --no-default-features
+divoom-ditoo-pro-controller --transport usb firmware-update firmware/306027-lua.MVA
+```
+
+The pinned HCI handler begins at decoded address `0x121c6c`; its packet has a
+16-bit length at +8 and an event pointer at +12. The hook replays the original
+six-byte prologue and resumes at `0x121c72`. The stock application callback hook
+at `0x7ec20` replays four replaced bytes and resumes at `0x7ec24`. The builder
+checks original bytes against pinned stock and the linker constrains hook and
+memory sizes. These addresses were matched against the related SDK's
+`HciProcessEvent` and `BT_STACK_CALLBACK_PARAMS`, then checked in stock assembly.
+HCI fields follow the [Bluetooth HCI specification](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html).
+
+Command 0x37 payload: `7f 44 4c 55 41 0d` followed by a little-endian u32 last-seen
+sequence. Reply: `DBTR`, ABI 1, error byte, record count, capacity, oldest retained
+and latest sequence (u32 each). Each 24-byte record contains u32 sequence, u32
+milliseconds, u8 layer, u8 event, u8 length, a reserved zero byte, and 12 padded
+metadata bytes. Wrong request length returns error 1; 306036 returns error 2 if the ring cannot
+be allocated while preserving native headroom. An optional byte after the cursor
+is 1 to acquire/renew, or 0 to release the lease. Firmware 306043 also accepts 2
+to acquire/renew and append a radio snapshot before reading. The original read packet also
+acquires/renews. Oldest may be latest+1 for an empty newly acquired/released ring.
+There is no raw address, buffer resize or Lua dependency.
+
+The radio snapshot is layer 7, event 1, with eight bytes: advertising active,
+requested, allowed, pending bits, identity phase, HID state, then the little-endian
+HID connection handle. It uses the existing leased ring and adds no persistent
+RAM allocation. The snapshot is copied with interrupts masked, as are ring reads.
+
+## Hardware verification
+
+[306027 verification](../firmware/tv-persistent-link-evidence/verification.json):
+the disconnect-caller hooks identified native application requests immediately
+before the TV's local-host termination. The keyboard-only guard suppressed those
+requests on the real device, including during a twelve-minute idle interval with
+the laptop disconnected. Explicit HID OFF and reconnection remained functional.
+
+[Verification report](../firmware/bluetooth-trace-evidence/verification.json):
+USB flashed and read back 306024; real laptop pairing, encrypted HID, reconnection,
+bond reuse, pairing-window expiry and Lua-crash recovery passed. Laptop `btmon`
+and the Ditoo trace both recorded successful pairing. Observing the TV app left
+its generation unchanged while callbacks continued. Temporary laptop bonds and
+pairing settings were restored, and the saved TV settings were unchanged.
+
+The TV connection recorded HCI authentication failure 0x05 and disconnection
+before HID opened. A subsequent fresh pairing succeeded, enabled encryption
+and opened both HID channels. The owner then confirmed physical Play/Pause in
+SmartTube. The earlier authentication failure does not identify which endpoint
+had incorrect pairing state. The TV also connected the stock audio profile,
+which the owner disabled manually; this remains a separate behavior to fix.
+
+42 of 43 hardware runtime checks passed. The maximum 8192-byte upload was refused
+by the stock-heap headroom guard after Bluetooth lifecycle testing; a targeted
+retry had the same result. The 7828-byte TV bundle still loaded and runs. The
+trace fits the existing static reservation and the heap safety threshold was
+not changed. This maximum-size stress failure remains in the report.

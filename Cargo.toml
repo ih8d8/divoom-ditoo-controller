@@ -1,0 +1,44 @@
+[package]
+name = "divoom-ditoo-controller"
+version = "0.1.0"
+edition = "2024"
+description = "Linux integration & programmable notification display for Divoom Ditoo Pro"
+authors = ["Divoom Ditoo Controller Contributors <contributors@noreply.github.com>"]
+license = "MIT"
+repository = "https://github.com/ih8d8/divoom-ditoo-controller"
+readme = "README.md"
+default-run = "ditoo"
+
+[lib]
+name = "divoom_ditoo_controller"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ditoo"
+path = "src/main.rs"
+
+[[bin]]
+name = "divoom-ditoo-controller"
+path = "src/bin/divoom-ditoo-controller.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "net", "process", "signal"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+dirs = "7.0"
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+divoom-ditoo-pro-controller = { path = "vendor/divoom-ditoo-pro-controller", default-features = false, features = ["text", "all-image-formats"] }
+bluer = "0.17"
+libc = "0.2"
+csscolorparser = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

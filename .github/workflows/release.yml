@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libfontconfig1-dev
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package release assets
+        run: |
+          mkdir -p dist/ditoo-linux-x86_64
+          cp target/release/ditoo dist/ditoo-linux-x86_64/
+          cp target/release/divoom-ditoo-controller dist/ditoo-linux-x86_64/
+          cp scripts/ditoo-notification-daemon dist/ditoo-linux-x86_64/
+          cp systemd/ditoo.service dist/ditoo-linux-x86_64/
+          cp README.md dist/ditoo-linux-x86_64/
+          cp LICENSE dist/ditoo-linux-x86_64/
+          
+          # Create compressed tarball with all files
+          tar -czvf ditoo-linux-x86_64.tar.gz -C dist/ditoo-linux-x86_64 .
+          sha256sum ditoo-linux-x86_64.tar.gz > ditoo-linux-x86_64.tar.gz.sha256
+
+          # Create named release tarball matching package name
+          cp ditoo-linux-x86_64.tar.gz divoom-ditoo-controller-linux-x86_64.tar.gz
+          sha256sum divoom-ditoo-controller-linux-x86_64.tar.gz > divoom-ditoo-controller-linux-x86_64.tar.gz.sha256
+
+          # Create standalone binary assets for direct curl
+          cp target/release/ditoo ditoo-linux-x86_64
+          sha256sum ditoo-linux-x86_64 > ditoo-linux-x86_64.sha256
+
+          cp target/release/divoom-ditoo-controller divoom-ditoo-controller-linux-x86_64
+          sha256sum divoom-ditoo-controller-linux-x86_64 > divoom-ditoo-controller-linux-x86_64.sha256
+
+      - name: Upload Release to GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ditoo-linux-x86_64.tar.gz
+            ditoo-linux-x86_64.tar.gz.sha256
+            divoom-ditoo-controller-linux-x86_64.tar.gz
+            divoom-ditoo-controller-linux-x86_64.tar.gz.sha256
+            ditoo-linux-x86_64
+            ditoo-linux-x86_64.sha256
+            divoom-ditoo-controller-linux-x86_64
+            divoom-ditoo-controller-linux-x86_64.sha256
+          generate_release_notes: true

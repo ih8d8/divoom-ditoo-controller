@@ -1,0 +1,6 @@
+/target
+vendor/**/target
+vendor/**/firmware
+*.swp
+*~
+.DS_Store

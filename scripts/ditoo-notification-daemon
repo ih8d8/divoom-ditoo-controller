@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2310
+# ditoo-notification-daemon — Universal Desktop Notification Monitor & Clock Controller for Divoom Ditoo Pro
+# Compatible with Dunst, QuickShell, Mako, SwayNotificationCenter, and any standard org.freedesktop.Notifications system.
+# Designed for Arch Linux, Hyprland, and BlueZ Bluetooth environments.
+# Dynamically discovers paired Ditoo devices and operates without hardcoded MACs or machine checks.
+
+set -euo pipefail
+
+# Ensure ~/.local/bin or any other user bin directories are in PATH for ditoo CLI invocation
+export PATH="${HOME}/.local/bin:${HOME}/bin:/usr/local/bin:${PATH}"
+
+# Maximum auto-connection attempts per disconnect event
+readonly MAX_CONNECT_ATTEMPTS=3
+
+# --- Device Discovery ---
+get_device_mac() {
+    # 1. Environment variable override
+    if [[ -n "${DITOO_MAC:-}" ]]; then
+        echo "${DITOO_MAC}"
+        return 0
+    fi
+
+    # 2. Config file override (~/.config/ditoo/config.json)
+    local cfg="${XDG_CONFIG_HOME:-${HOME}/.config}/ditoo/config.json"
+    if [[ -f "${cfg}" ]]; then
+        local configured
+        configured=$(grep -oP '"device_mac":\s*"\K[0-9A-Fa-f:]{17}' "${cfg}" 2>/dev/null || true)
+        if [[ -n "${configured}" ]]; then
+            echo "${configured}"
+            return 0
+        fi
+    fi
+
+    # 3. Dynamic Bluetooth discovery from paired devices
+    local discovered
+    discovered=$(bluetoothctl devices 2>/dev/null | grep -iE "ditoo|divoom" | head -n1 | awk '{print $2}' || true)
+    if [[ -n "${discovered}" ]]; then
+        echo "${discovered}"
+        return 0
+    fi
+    return 1
+}
+
+MAC="$(get_device_mac || true)"
+
+# shellcheck disable=SC2310
+is_paired() {
+    if [[ -z "${MAC}" ]]; then
+        MAC="$(get_device_mac || true)"
+    fi
+    if [[ -n "${MAC}" ]] && bluetoothctl info "${MAC}" 2>/dev/null | grep -q "Paired: yes"; then
+        return 0
+    fi
+    # If not paired or device was removed, reset MAC to allow re-discovery
+    MAC=""
+    return 1
+}
+
+# shellcheck disable=SC2310
+is_connected() {
+    if [[ -z "${MAC}" ]]; then
+        MAC="$(get_device_mac || true)"
+    fi
+    [[ -n "${MAC}" ]] && bluetoothctl info "${MAC}" 2>/dev/null | grep -q "Connected: yes"
+}
+
+# shellcheck disable=SC2310
+is_adapter_powered() {
+    bluetoothctl show 2>/dev/null | grep -q "Powered: yes"
+}
+
+# Check argument for systemd ExecCondition
+if [[ "${1:-}" == "--check" ]]; then
+    if ! is_paired; then
+        echo "[ditoo] No paired Ditoo Pro device found on this machine." >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+# Guard for direct execution when not paired
+if ! is_paired; then
+    echo "[ditoo] No paired Ditoo Pro device detected. Exiting."
+    exit 0
+fi
+
+echo "[ditoo] Starting Ditoo Pro Universal Notification Daemon for device: ${MAC}..."
+
+# Track last notification to suppress rapid duplicates
+LAST_NOTIFICATION=""
+LAST_TIME=0
+
+# Background task: Periodic RTC clock sync & auto-connection loop
+sync_clock_loop() {
+    local first=1
+    local counter=0
+    local retry_count=0
+    local adapter_was_powered=1
+
+    while true; do
+        local adapter_powered=0
+        if is_adapter_powered; then
+            adapter_powered=1
+        fi
+
+        # If Bluetooth adapter transitioned from powered-off to powered-on, reset retry counter
+        if [[ ${adapter_was_powered} -eq 0 && ${adapter_powered} -eq 1 ]]; then
+            echo "[ditoo] Bluetooth adapter powered on. Resetting connection attempts."
+            retry_count=0
+        fi
+        adapter_was_powered=${adapter_powered}
+
+        if is_connected; then
+            if [[ ${first} -eq 1 ]]; then
+                echo "[ditoo] Ditoo Pro connected: performing initial clock sync..."
+                ditoo sync-time 2>/dev/null || true
+                ditoo clock 2>/dev/null || true
+                first=0
+                counter=0
+                retry_count=0
+            else
+                counter=$((counter + 1))
+                if [[ ${counter} -ge 360 ]]; then # 360 * 10s = 3600s = 1 hour
+                    echo "[ditoo] Hourly RTC clock synchronization..."
+                    ditoo sync-time 2>/dev/null || true
+                    counter=0
+                fi
+            fi
+            sleep 10
+        else
+            first=1
+            counter=0
+
+            # Only attempt connection if device is paired and Bluetooth adapter is powered
+            if is_paired && [[ ${adapter_powered} -eq 1 ]]; then
+                if [[ ${retry_count} -lt ${MAX_CONNECT_ATTEMPTS} ]]; then
+                    retry_count=$((retry_count + 1))
+                    echo "[ditoo] Attempting background connection to ${MAC} (attempt ${retry_count} of ${MAX_CONNECT_ATTEMPTS})..."
+
+                    timeout 5 bluetoothctl connect "${MAC}" >/dev/null 2>&1 || true
+
+                    if is_connected; then
+                        echo "[ditoo] Background auto-connection successful!"
+                        retry_count=0
+                        # Allow BlueZ 2 seconds to settle RFCOMM/SDP channels
+                        sleep 2
+                        continue
+                    fi
+
+                    if [[ ${retry_count} -ge ${MAX_CONNECT_ATTEMPTS} ]]; then
+                        echo "[ditoo] Device not reachable after ${MAX_CONNECT_ATTEMPTS} attempts. Pausing active connect attempts; waiting for device to connect."
+                    fi
+                fi
+            fi
+
+            # Passive sleep without issuing connect commands
+            sleep 10
+        fi
+    done
+}
+
+sync_clock_loop &
+SYNC_PID=$!
+
+cleanup() {
+    echo "[ditoo] Shutting down daemon..."
+    kill "${SYNC_PID}" 2>/dev/null || true
+    jobs -p | xargs -r kill 2>/dev/null || true
+    exit 0
+}
+trap cleanup SIGINT SIGTERM
+
+# Parse and handle notification
+handle_notification() {
+    local app="$1"
+    local summary="$2"
+    local body="$3"
+
+    # Ignore noise (volume, brightness, media player title spam)
+    local lower_app="${app,,}"
+    local lower_summary="${summary,,}"
+    local lower_body="${body,,}"
+
+    if [[ "${lower_app}" =~ (spotify|chromium|firefox|brave|volume|brightness|bar-text|qs-shell) && ! "${lower_summary}" =~ (claude|codex|antigravity|done|error|complete) ]]; then
+        return 0
+    fi
+
+    # Deduplicate within 3 seconds
+    local now
+    now=$(date +%s)
+    local combo="${app}:${summary}:${body}"
+    if [[ "${combo}" == "${LAST_NOTIFICATION}" && $((now - LAST_TIME)) -lt 3 ]]; then
+        return 0
+    fi
+    LAST_NOTIFICATION="${combo}"
+    LAST_TIME="${now}"
+
+    # Only process if device is connected
+    if ! is_connected; then
+        return 0
+    fi
+
+    # Select icon based on content and application name
+    local icon="info"
+
+    # 1. AI Coding Agents
+    if [[ "${lower_app}" =~ (claude|clot) || "${lower_summary}" =~ (claude|clot) || "${lower_body}" =~ (claude|clot) ]]; then
+        icon="claude"
+    elif [[ "${lower_app}" =~ (codex|openai|open.?code) || "${lower_summary}" =~ (codex|openai|open.?code) || "${lower_body}" =~ (codex|openai|open.?code) ]]; then
+        icon="codex"
+    elif [[ "${lower_app}" =~ (antigravity|deepmind|agy) || "${lower_summary}" =~ (antigravity|deepmind|agy) || "${lower_body}" =~ (antigravity|deepmind|agy) ]]; then
+        icon="antigravity"
+    # 2. Email & Messaging
+    elif [[ "${lower_app}" =~ (thunderbird|geary|neomutt|mutt|mail|aerc|evolution|kmail) || "${lower_summary}" =~ (mail|email|inbox|letter) ]]; then
+        icon="mail"
+    elif [[ "${lower_app}" =~ (slack|discord|telegram|signal|element|matrix|whatsapp|weechat) || "${lower_summary}" =~ (message|chat|dm) ]]; then
+        icon="chat"
+    # 3. Calendar & Meetings
+    elif [[ "${lower_app}" =~ (calendar|korganizer|evolution-alarm) || "${lower_summary}" =~ (meeting|calendar|schedule|appointment) ]]; then
+        icon="calendar"
+    # 4. Music & Media
+    elif [[ "${lower_app}" =~ (spotify|cider|amberol|ncmpcpp|mpv|music) ]]; then
+        icon="music"
+    # 5. Terminal & Builds
+    elif [[ "${lower_app}" =~ (alacritty|kitty|foot|wezterm|ghostty|terminal|cargo|makepkg|yay|pacman) ]]; then
+        icon="terminal"
+    # 6. Git & GitHub
+    elif [[ "${lower_app}" =~ (git|github|gitlab|forgejo) || "${lower_summary}" =~ (pull\ request|merge|commit|git) ]]; then
+        icon="git"
+    # 7. Status Alerts
+    elif [[ "${lower_summary}" =~ (error|fail|failed) || "${lower_body}" =~ (error|fail|failed) ]]; then
+        icon="error"
+    elif [[ "${lower_summary}" =~ (warn|alert|approval|attention|prompt|input|action) || "${lower_body}" =~ (warn|alert|approval|attention|prompt|input|action) ]]; then
+        icon="alert"
+    elif [[ "${lower_summary}" =~ (busy|running|building|progress) || "${lower_body}" =~ (busy|running|building|progress) ]]; then
+        icon="busy"
+    elif [[ "${lower_summary}" =~ (done|complete|finished|success) || "${lower_body}" =~ (done|complete|finished|success) ]]; then
+        icon="done"
+    elif [[ "${lower_summary}" =~ (disk|drive|storage|filesystem|space) || "${lower_body}" =~ (disk|drive|storage|filesystem|space) ]]; then
+        icon="disk"
+    elif [[ "${lower_summary}" =~ (bell|remind|reminder) ]]; then
+        icon="bell"
+    else
+        # Check user custom icon in ~/.config/ditoo/icons/<app>.png
+        if [[ -f "${XDG_CONFIG_HOME:-${HOME}/.config}/ditoo/icons/${lower_app}.png" || \
+              -f "${XDG_DATA_HOME:-${HOME}/.local/share}/ditoo/icons/${lower_app}.png" ]]; then
+            icon="${lower_app}"
+        else
+            icon="info"
+        fi
+    fi
+
+    local display_text="${summary:-${app}}"
+    display_text="${display_text:-Notification}"
+    echo "[ditoo] Desktop notification: [${app}] '${display_text}' -> icon '${icon}'"
+
+    # Send to Ditoo display (holds for 5s then automatically restores native clock)
+    ditoo notify "${display_text}" --icon "${icon}" --duration 5 2>/dev/null || true
+}
+
+# --- Main DBus Monitor Loop ---
+in_call=0
+step=0
+app=""
+summary=""
+body=""
+
+echo "[ditoo] Monitoring desktop notifications via DBus (Dunst, QuickShell, Mako, etc.)..."
+
+dbus-monitor --session "type='method_call',interface='org.freedesktop.Notifications',member='Notify'" 2>/dev/null | while IFS= read -r line; do
+    if [[ "${line}" == *"member=Notify"* ]]; then
+        in_call=1
+        step=0
+        app=""
+        summary=""
+        body=""
+        continue
+    fi
+
+    if [[ ${in_call} -eq 1 ]]; then
+        if [[ "${line}" =~ string\ \"(.*)\" ]]; then
+            step=$((step + 1))
+            val="${BASH_REMATCH[1]}"
+            if [[ ${step} -eq 1 ]]; then
+                app="${val}"
+            elif [[ ${step} -eq 3 ]]; then
+                summary="${val}"
+            elif [[ ${step} -eq 4 ]]; then
+                body="${val}"
+                in_call=0
+                handle_notification "${app}" "${summary}" "${body}"
+            fi
+        fi
+    fi
+done
